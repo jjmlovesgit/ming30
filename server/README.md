@@ -55,6 +55,7 @@ Adapter only, backend already running: `.\run.ps1 -AdapterOnly`.
 | `GET` | `/v1/audio/voices/{name}/audio` | download the stored reference |
 | `DELETE` | `/v1/audio/voices/{name}` | remove a cloned voice |
 | `POST` | `/v1/audio/speech` | the main route; JSON in, audio out |
+| `POST` | `/v1/audio/transcriptions` | multipart WAV in; `json`, `text`, `srt`, `vtt`, `verbose_json` out |
 
 `POST /v1/audio/speech` accepts:
 
@@ -92,6 +93,7 @@ request them without `stream`.
 | `MING30_BACKEND_URL` | `http://127.0.0.1:8090` | audio.cpp server |
 | `MING30_MODEL` | `ming-tts` | backend model id for offline generation |
 | `MING30_STREAM_MODEL` | `ming-tts-stream` | backend model id configured `mode: streaming`; empty disables |
+| `MING30_ASR_MODEL` | `ming-asr` | backend model id (`family ming3_audio`, `task asr`); empty disables transcription |
 | `MING30_MODEL_ALIASES` | `ming30,ming-3.0-tts,tts-1,tts-1-hd,ming-3.0-tts-0.5b` | names clients may send |
 | `MING30_VOICE_DIR` | `voices` | cloned reference WAVs (resolved absolute) |
 | `MING30_TMP_DIR` | `.ming30-tmp` | ffmpeg scratch space |
@@ -99,6 +101,64 @@ request them without `stream`.
 | `MING30_BACKEND_TIMEOUT` | `300` | seconds; a cold load can take ~40 s |
 | `MING30_PORT` / `MING30_HOST` | `8070` / `127.0.0.1` | adapter bind |
 | `MING30_CORS` | unset | set to anything to enable permissive CORS (local demos only) |
+
+## Speech in and out
+
+The Ming 3.0 family covers both directions, with two different checkpoints: the
+0.5B TTS model synthesises, and **Ming 3.0 Audio Tiny** transcribes. Both are
+backend entries in one engine process, so a single stack does round-trip speech.
+
+```powershell
+# speak, then transcribe what came back
+$wav = client.post("/v1/audio/speech", json={"input": "The garden will remain open.", "response_format": "wav"})
+client.post("/v1/audio/transcriptions",
+            data={"model": "whisper-1", "response_format": "verbose_json"},
+            files={"file": ("speech.wav", $wav.content, "audio/wav")})
+# -> {"task": "transcribe", "language": "en", "duration": 2.1, "text": "the garden will remain open", "segments": [...]}
+```
+
+The engine returns `"<Language>\t<text>"`; the adapter splits that into
+`language` plus `text` and is responsible for `srt`/`vtt`/`verbose_json`, because
+the native route always answers JSON regardless of `response_format`.
+`model="whisper-1"` is accepted for SDK compatibility and maps to the configured
+ASR entry; any other value is ignored.
+
+## Docker
+
+`compose.yaml` at the repository root runs the whole stack: the native engine in a
+CUDA image plus this adapter.
+
+```bash
+cp .env.example .env          # MING30_MODEL_DIR, ports
+docker compose up --build
+docker compose exec ming30 python scripts/smoke_test.py --reference /voices/ref.wav
+```
+
+Requirements on the host: Docker with GPU support (NVIDIA Container Toolkit, or
+Docker Desktop with WSL2 GPU passthrough), and both GGUFs under
+`${MING30_MODEL_DIR}`:
+
+```
+models/ming3-tts/ming-3.0-tts-0.5b-q8_0.gguf
+models/audio-tiny/ming-3.0-audio-tiny-q4_k.gguf
+```
+
+`server/voices` is mounted at the **same path** (`/voices`) in both containers,
+which is what makes the adapter's absolute `voice_ref` paths resolvable by the
+engine. The engine image builds the `ubuntu-x64-cuda12.8` release tarball; it needs
+no compiler, just the CUDA runtime.
+
+If the engine already runs on the host (the Windows setup in
+`../RUNNING-ming30.md`), start only the adapter:
+
+```bash
+docker compose up ming30 --no-deps -e MING30_BACKEND_URL=http://host.docker.internal:8090
+```
+
+> Status: the adapter path is verified end to end on Windows against the native
+> engine (14/14 smoke checks). The compose stack itself has **not** been executed
+> in this environment — Docker is not installed here — so treat the image build as
+> untested until you run it once.
 
 ## Measured on an RTX 5090
 
@@ -111,6 +171,8 @@ Backend and adapter on the same machine, Q8_0 checkpoint, warm model:
 | Streaming PCM, time to first chunk | **0.13–0.32 s** |
 | Streaming, 4.50 s of audio | 15 chunks |
 | MP3 transcode overhead | included above; ffmpeg writes ~110 KB |
+| Transcription, 4.50 s of audio | **~0.1 s warm** (engine RTF 0.029); round-trip similarity 1.00 |
+| Transcription model load | ~25 s once, on the first ASR request |
 | Model load (once per backend process) | ~35–40 s |
 
 The adapter adds roughly 0.05–0.1 s on top of the engine's own RTF; the
@@ -124,8 +186,9 @@ dominant term is inference, not HTTP.
 - **One inference at a time per backend model.** The native server serialises
   requests and returns `503 server_busy` past `busy_timeout_ms`; the adapter maps
   that to a 502 with the backend's message.
-- **No `/v1/audio/transcriptions`.** Ming 3.0 *Audio* Tiny can transcribe, but it
-  is a different checkpoint and would need its own backend entry.
+- **Transcription takes WAV uploads only, and produces one segment.** The engine
+  route decodes WAV; mp3/flac uploads are rejected. No per-word timestamps, so
+  `verbose_json` and `srt`/`vtt` carry a single cue spanning the file.
 - **No voice-design route yet.** `voice_design` is reachable today only by sending
   `options: {"instruct": "...", "template_name": "voice_design"}`.
 - Streaming is PCM/WAV only; mp3 streaming would need a persistent encoder.

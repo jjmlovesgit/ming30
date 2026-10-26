@@ -73,6 +73,29 @@ class Backend:
                 except json.JSONDecodeError:
                     continue
 
+    # -- transcription -------------------------------------------------
+    async def transcribe(
+        self,
+        *,
+        model: str,
+        audio: bytes,
+        filename: str = "audio.wav",
+        language: str | None = None,
+    ) -> dict:
+        """POST a WAV payload to the backend's transcription route."""
+
+        data = {"model": model}
+        if language:
+            data["language"] = language
+        response = await self._client.post(
+            "/v1/audio/transcriptions",
+            data=data,
+            files={"file": (filename, audio, "audio/wav")},
+        )
+        if response.status_code >= 400:
+            raise BackendError(response.status_code, _error_message(response))
+        return _json_or_error(response)
+
 
 def _json_or_error(response: httpx.Response) -> dict:
     if response.status_code >= 400:

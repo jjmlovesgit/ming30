@@ -9,8 +9,10 @@ what it verified, so a partial failure still shows the last good state.
 from __future__ import annotations
 
 import argparse
+import difflib
 import io
 import json
+import re
 import sys
 import time
 
@@ -18,6 +20,10 @@ import httpx
 
 TEXT = "The garden will remain open until sunset, provided the weather stays clear."
 HITS: list[tuple[str, bool, str]] = []
+
+
+def normalize(value: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", "", value.lower()).strip()
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -45,16 +51,42 @@ def main() -> int:
 
     # 3. plain wav
     started = time.time()
-    response = client.post("/v1/audio/speech", json={"input": TEXT, "response_format": "wav"})
+    wav_response = client.post("/v1/audio/speech", json={"input": TEXT, "response_format": "wav"})
     wall = time.time() - started
-    seconds = float(response.headers.get("x-ming30-audio-seconds", 0) or 0)
-    ok = response.status_code == 200 and response.content[:4] == b"RIFF" and seconds > 0
+    seconds = float(wav_response.headers.get("x-ming30-audio-seconds", 0) or 0)
+    ok = wav_response.status_code == 200 and wav_response.content[:4] == b"RIFF" and seconds > 0
     rtf = wall / seconds if seconds else 0
-    check("speech wav", ok, f"{len(response.content)} B, {seconds:.2f}s audio, {wall:.2f}s wall, rtf {rtf:.3f}")
+    check("speech wav", ok, f"{len(wav_response.content)} B, {seconds:.2f}s audio, {wall:.2f}s wall, rtf {rtf:.3f}")
 
     # 4. mp3 transcode
     response = client.post("/v1/audio/speech", json={"input": TEXT, "response_format": "mp3"})
     check("speech mp3", response.status_code == 200 and len(response.content) > 1000, f"{len(response.content)} B")
+
+    # 4b. transcription round-trip on the WAV generated above
+    transcript = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "whisper-1", "response_format": "verbose_json"},
+        files={"file": ("speech.wav", wav_response.content, "audio/wav")},
+    )
+    if transcript.status_code == 200:
+        payload = transcript.json()
+        heard = normalize(payload.get("text", ""))
+        expected = normalize(TEXT)
+        similarity = difflib.SequenceMatcher(None, heard, expected).ratio()
+        check(
+            "transcribe wav",
+            similarity > 0.8,
+            f"{payload.get('language')} {payload.get('duration')}s, similarity {similarity:.2f}",
+        )
+    else:
+        check("transcribe wav", False, f"HTTP {transcript.status_code}: {transcript.text[:120]}")
+
+    srt = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "whisper-1", "response_format": "srt"},
+        files={"file": ("speech.wav", wav_response.content, "audio/wav")},
+    )
+    check("transcribe srt", srt.status_code == 200 and b"-->" in srt.content, srt.text.splitlines()[1] if srt.status_code == 200 else "")
 
     # 5. built-in voice
     response = client.post(

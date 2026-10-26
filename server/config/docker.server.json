@@ -1,0 +1,36 @@
+{
+  "host": "0.0.0.0",
+  "port": 8090,
+  "backend": "cuda",
+  "device": 0,
+  "threads": 4,
+  "lazy_load": true,
+  "max_loaded_models": 0,
+  "busy_timeout_ms": 120000,
+  "log_request_body": false,
+  "models": [
+    {
+      "id": "ming-tts",
+      "family": "ming3_tts",
+      "path": "/models/ming3-tts/ming-3.0-tts-0.5b-q8_0.gguf",
+      "task": "tts",
+      "mode": "offline",
+      "default_request_options": { "language": "en" }
+    },
+    {
+      "id": "ming-tts-stream",
+      "family": "ming3_tts",
+      "path": "/models/ming3-tts/ming-3.0-tts-0.5b-q8_0.gguf",
+      "task": "tts",
+      "mode": "streaming",
+      "default_request_options": { "language": "en" }
+    },
+    {
+      "id": "ming-asr",
+      "family": "ming3_audio",
+      "path": "/models/audio-tiny/ming-3.0-audio-tiny-q4_k.gguf",
+      "task": "asr",
+      "mode": "offline"
+    }
+  ]
+}

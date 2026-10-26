@@ -17,6 +17,7 @@ from . import __version__
 from .audio import CONTENT_TYPES, SUPPORTED_FORMATS, AudioError, ffmpeg_available, transcode, wav_info, wav_stream_header
 from .backend import Backend, BackendError
 from .settings import Settings
+from .transcripts import language_code, split_language_prefix, to_srt, to_vtt
 from .voices import VoiceError, VoiceStore
 
 
@@ -108,6 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=503,
             )
         state["voices"] = len(app.state.voices.list())
+        state["transcription"] = settings.asr_model or None
         return state
 
     @app.get("/v1/models")
@@ -130,7 +132,76 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "loaded": loaded.get(settings.model),
                     }
                 )
+        if settings.transcription_enabled:
+            data.append(
+                {
+                    "id": "whisper-1",
+                    "object": "model",
+                    "owned_by": "ming30",
+                    "backend_model": settings.asr_model,
+                    "loaded": loaded.get(settings.asr_model),
+                }
+            )
         return {"object": "list", "data": data}
+
+    # -- transcription -------------------------------------------------
+    @app.post("/v1/audio/transcriptions")
+    async def transcriptions(
+        file: UploadFile = File(...),
+        model: str = Form("whisper-1"),
+        language: str | None = Form(None),
+        prompt: str | None = Form(None),
+        response_format: str = Form("json"),
+        temperature: float | None = Form(None),
+    ):
+        if not settings.transcription_enabled:
+            return _error(
+                "transcription is disabled; set MING30_ASR_MODEL to an audio.cpp model id "
+                "(family ming3_audio, task asr)",
+                status=503,
+                code="transcription_unavailable",
+            )
+
+        payload = await file.read()
+        if len(payload) > settings.max_upload_bytes:
+            return _error(f"audio exceeds {settings.max_upload_bytes} bytes", status=413)
+        if payload[:4] != b"RIFF":
+            return _error("audio must be a WAV file (RIFF)")
+
+        result = await app.state.backend.transcribe(
+            model=settings.asr_model,
+            audio=payload,
+            filename=file.filename or "audio.wav",
+            language=language,
+        )
+        detected, text = split_language_prefix(str(result.get("text", "")))
+        timing = result.get("timing") or {}
+        duration = float(timing.get("audio_duration_ms") or 0) / 1000.0
+        code = language_code(detected)
+        fmt = (response_format or "json").lower()
+
+        if fmt == "text":
+            return Response(text, media_type="text/plain; charset=utf-8")
+        if fmt == "srt":
+            return Response(to_srt(text, duration), media_type="application/x-subrip; charset=utf-8")
+        if fmt == "vtt":
+            return Response(to_vtt(text, duration), media_type="text/vtt; charset=utf-8")
+        if fmt == "verbose_json":
+            return {
+                "task": "transcribe",
+                "language": code,
+                "duration": round(duration, 3),
+                "text": text,
+                "segments": [
+                    {
+                        "id": 0,
+                        "start": 0.0,
+                        "end": round(max(duration, 0.001), 3),
+                        "text": text,
+                    }
+                ],
+            }
+        return {"text": text}
 
     # -- voices --------------------------------------------------------
     @app.get("/v1/audio/voices")

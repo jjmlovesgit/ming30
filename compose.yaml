@@ -1,0 +1,82 @@
+# Ming 3.0 speech stack: native engine (GPU) + OpenAI-compatible adapter.
+#
+#   docker compose up --build          # both services
+#   docker compose exec ming30 python scripts/smoke_test.py --reference /voices/<name>.wav
+#
+# Model files are read-only from MING30_MODEL_DIR (default ./models):
+#
+#   models/
+#     ming3-tts/ming-3.0-tts-0.5b-q8_0.gguf
+#     audio-tiny/ming-3.0-audio-tiny-q4_k.gguf
+#
+# Engine-only fallback (backend already running on the host, e.g. Windows):
+#   docker compose up ming30 --no-deps -e MING30_BACKEND_URL=http://host.docker.internal:8090
+
+name: ming30
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  engine:
+    build:
+      context: ./server/engine
+      args:
+        AUDIO_CPP_VERSION: v0.9.3
+        AUDIO_CPP_FLAVOR: cuda12.8
+    image: ming30-engine:0.9.3
+    <<: *gpu
+    command: ["--config", "/config/server.json", "--no-ui"]
+    working_dir: /engine
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ${MING30_MODEL_DIR:-./models}:/models:ro
+      # Same path inside both containers, so the absolute reference paths the
+      # adapter hands to the engine resolve identically.
+      - ./server/voices:/voices
+      - ./server/config/docker.server.json:/config/server.json:ro
+    ports:
+      - "${MING30_ENGINE_PORT:-8090}:8090"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  ming30:
+    build:
+      context: ./server
+    image: ming30-server:0.1.0
+    depends_on:
+      engine:
+        condition: service_healthy
+    environment:
+      MING30_HOST: 0.0.0.0
+      MING30_PORT: "8070"
+      MING30_BACKEND_URL: http://engine:8090
+      MING30_MODEL: ming-tts
+      MING30_STREAM_MODEL: ming-tts-stream
+      MING30_ASR_MODEL: ming-asr
+      MING30_VOICE_DIR: /voices
+      MING30_TMP_DIR: /tmp/ming30
+    volumes:
+      - ./server/voices:/voices
+    ports:
+      - "${MING30_PORT:-8070}:8070"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8070/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped

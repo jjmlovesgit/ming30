@@ -2,8 +2,10 @@
 models/
 audio.cpp-0.9.3*/
 audio-cpp-win-*.zip
+audio-cpp-linux-*.tar.gz
 out/
 cuda13-runtime/
+.env
 
 # server runtime state
 server/.ming30-tmp/

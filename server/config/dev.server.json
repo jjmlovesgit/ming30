@@ -24,6 +24,13 @@
       "task": "tts",
       "mode": "streaming",
       "default_request_options": { "language": "en" }
+    },
+    {
+      "id": "ming-asr",
+      "family": "ming3_audio",
+      "path": "C:/Users/Jim/.lmstudio/models/audio-cpp/Ming-3.0-Audio-Tiny-GGUF/ming-3.0-audio-tiny-q4_k.gguf",
+      "task": "asr",
+      "mode": "offline"
     }
   ]
 }

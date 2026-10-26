@@ -22,6 +22,8 @@ class Settings:
     model: str = field(default_factory=lambda: _env("MING30_MODEL", "ming-tts"))
     # backend model id configured with mode=streaming; empty disables true streaming
     stream_model: str = field(default_factory=lambda: _env("MING30_STREAM_MODEL", "ming-tts-stream"))
+    # backend model id for transcription (Ming 3.0 Audio Tiny); empty disables the route
+    asr_model: str = field(default_factory=lambda: _env("MING30_ASR_MODEL", "ming-asr"))
     # where uploaded reference recordings live (resolved to an absolute path;
     # the audio.cpp backend opens these files itself, from its own cwd)
     voice_dir: Path = field(default_factory=lambda: Path(_env("MING30_VOICE_DIR", "voices")))
@@ -47,6 +49,10 @@ class Settings:
     @property
     def streaming_enabled(self) -> bool:
         return bool(self.stream_model)
+
+    @property
+    def transcription_enabled(self) -> bool:
+        return bool(self.asr_model)
 
     def resolved_voice_dir(self) -> Path:
         return self.voice_dir.expanduser().resolve()

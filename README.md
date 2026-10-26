@@ -81,10 +81,11 @@ Transcripts do not separate the two checkpoints at this length — judge natural
 
 ## Server
 
-`server/` is an OpenAI-compatible adapter over the audio.cpp runtime:
-`/v1/audio/speech` with PCM/WAV streaming, mp3/opus/flac transcoding, a voice
-library with upload endpoints, model aliases and an OpenAI error envelope.
-Details and the env-var reference: [server/README.md](server/README.md).
+`server/` is an OpenAI-compatible adapter over the audio.cpp runtime, covering
+both directions of speech: `/v1/audio/speech` (PCM/WAV streaming, mp3/opus/flac
+transcoding, voice library with uploads) and `/v1/audio/transcriptions`
+(the Audio Tiny checkpoint, behind `whisper-1` in clients). Details and the
+env-var reference: [server/README.md](server/README.md).
 
 ```powershell
 cd server
@@ -92,8 +93,19 @@ cd server
 python scripts\smoke_test.py --reference ..\out\en\en_2.wav
 ```
 
+Or the whole stack in containers — `compose.yaml` at the root builds the native
+engine (CUDA) plus the adapter:
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
 Measured through the adapter on the RTX 5090, warm Q8_0 model: RTF ≈ 0.24
-offline, streaming time-to-first-chunk 0.13–0.32 s, 12/12 smoke checks.
+offline, streaming time-to-first-chunk 0.13–0.32 s, transcription ~0.1 s for
+4.5 s of audio, 14/14 smoke checks. The compose stack itself is untested here
+(Docker is not installed on this machine); the Windows engine path is what was
+verified.
 
 ## Gotchas
 

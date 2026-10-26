@@ -27,6 +27,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ming30 ./ming30
+COPY scripts ./scripts
+COPY examples ./examples
 RUN mkdir -p /app/voices /app/.ming30-tmp
 
 EXPOSE 8070
