@@ -22,3 +22,7 @@ __pycache__/
 .idea/
 Thumbs.db
 desktop.ini
+
+# local python deps extracted from wheels (gguf)
+.pydeps/
+.tmp/
