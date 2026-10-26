@@ -266,6 +266,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         voice = (body.voice or "").strip()
         if voice:
             if app.state.voices.is_builtin(voice):
+                if instruction:
+                    return _error(
+                        f"'{voice}' is a built-in voice and uses structured controls only; "
+                        "raw instructions are rejected by the engine. Drop 'instructions', "
+                        "or use a cloned voice (post a reference to /v1/audio/voices) which "
+                        "accepts instructions.",
+                    )
                 options["template_name"] = "ip"
                 options["voice_id"] = voice
                 payload["options"] = options

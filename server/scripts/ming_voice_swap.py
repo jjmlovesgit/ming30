@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import re
 import sys
 import tempfile
 import time
@@ -24,6 +25,7 @@ sys.path.insert(0, r"C:\Projects\ming30\server")
 import numpy as np
 import requests
 import soundfile as sf
+from scipy.signal import resample_poly
 
 import tts_pipeline as tp
 from tts_pipeline import (
@@ -42,7 +44,14 @@ from tts_pipeline import (
 )
 
 
-def synthesize(base_url: str, text: str, voice: str, language: str, seed: int | None) -> tuple[int, np.ndarray]:
+def synthesize(
+    base_url: str,
+    text: str,
+    voice: str,
+    language: str,
+    seed: int | None,
+    instruct: str | None = None,
+) -> tuple[int, np.ndarray]:
     """One TTS request through the OpenAI-shaped adapter, optionally seed-pinned."""
 
     payload: dict = {
@@ -54,10 +63,44 @@ def synthesize(base_url: str, text: str, voice: str, language: str, seed: int | 
     }
     if seed is not None:
         payload["options"] = {"seed": seed}
+    if instruct:
+        payload["instructions"] = instruct
     response = requests.post(f"{base_url.rstrip('/')}/v1/audio/speech", json=payload, timeout=600)
     response.raise_for_status()
     audio, rate = sf.read(io.BytesIO(response.content), dtype="float32", always_2d=True)
     return int(rate), audio.mean(axis=1)
+
+
+def rms_db(audio: np.ndarray) -> float:
+    if audio.size == 0:
+        return -120.0
+    return float(20.0 * np.log10(np.sqrt(np.mean(np.square(audio))) + 1e-9))
+
+
+def load_source(run_dir: Path, stem: str, rate: int) -> np.ndarray | None:
+    path = run_dir / f"{stem}.wav"
+    if not path.exists():
+        return None
+    audio, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    mono = audio.mean(axis=1)
+    if sample_rate != rate:
+        from scipy.signal import resample_poly
+
+        divisor = np.gcd(int(sample_rate), int(rate))
+        mono = resample_poly(mono, rate // divisor, int(sample_rate) // divisor).astype(np.float32)
+    return mono
+
+
+BACKCHANNEL = re.compile(
+    r"^(right|right\?|yeah|yeah\.|yes|exactly|exactly\.|absolutely|sure|well|okay|"
+    r"i mean|i see|how so\?|wrong\?|why\?|and\?|really\?|of course)[\s.,!?]*$",
+    re.IGNORECASE,
+)
+
+
+def is_backchannel(text: str, max_words: int) -> bool:
+    words = text.split()
+    return len(words) <= max_words or bool(BACKCHANNEL.match(text.strip()))
 
 
 def transcribe_errors(transcriber, audio: np.ndarray, rate: int, text: str, out_dir: Path, model: str, device: str, language: str) -> tuple[float, str]:
@@ -94,8 +137,21 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0, help="synthesize only N turns per stem")
     parser.add_argument("--out-dir", default="", help="where to write outputs (default: the run directory)")
     parser.add_argument("--tag", default="")
-    parser.add_argument("--retakes", type=int, default=0, help="re-synthesize a turn when its QA WER exceeds the threshold")
+    parser.add_argument("--retakes", type=int, default=0, help="extra takes allowed when a take fails the WER gate")
     parser.add_argument("--retake-threshold", type=float, default=0.04)
+    parser.add_argument("--candidates", type=int, default=1, help="passing takes to generate per turn before selecting")
+    parser.add_argument("--backchannel-words", type=int, default=3, help="turns at or below this length get the hint")
+    parser.add_argument("--backchannel-instruct", default="", help="delivery hint for short reactive turns")
+    parser.add_argument(
+        "--energy-weight",
+        type=float,
+        default=0.0,
+        help="weight of source-energy matching in take selection; off by default because per-stem "
+        "timings do not reliably align to the stem WAVs after editorial reassignment",
+    )
+    parser.add_argument("--fit-pacing", action="store_true", help="clamp per-turn duration toward the source window")
+    parser.add_argument("--fit-min", type=float, default=0.85, help="fastest allowed tempo factor")
+    parser.add_argument("--fit-max", type=float, default=1.15, help="slowest allowed tempo factor")
     parser.add_argument("--seeds", default="1895,7,99,1234")
     parser.add_argument("--qa-model", default="large-v3-turbo")
     parser.add_argument("--qa-device", default="cuda")
@@ -152,19 +208,30 @@ def main() -> int:
     timing_records = {"target": [], "residual": []}
     seeds = [int(value) for value in args.seeds.split(",") if value.strip()]
     transcriber = None
-    if args.retakes > 0:
+    if args.retakes > 0 or args.candidates > 1:
         from transcription import FasterWhisperTranscriber
 
         transcriber = FasterWhisperTranscriber()
-        print(f"retakes: up to {args.retakes} per turn when WER > {args.retake_threshold:.0%}, seeds={seeds}")
+        print(
+            f"selection: {args.candidates} passing take(s), up to "
+            f"{args.candidates + max(0, args.retakes)} takes per turn, "
+            f"WER gate {args.retake_threshold:.0%}, seeds={seeds}"
+        )
     started = time.time()
     done = 0
     retake_count = 0
+    instructed = 0
+    hint_disabled = False
+    ratios: list[float] = []
+    energy_deltas: list[float] = []
 
     for stem, voice in assignments:
         language = transcripts[stem].get("language") or args.language
         if len(str(language)) > 3:  # engine wants codes like "en"
             language = args.language
+        source_audio = load_source(run_dir, stem, output_rate)
+        if source_audio is None:
+            print(f"  note: {stem}.wav not found; energy scoring disabled for this stem")
         for turn in turns[stem]:
             start = float(turn["start_seconds"])
             end = float(turn["end_seconds"])
@@ -173,28 +240,95 @@ def main() -> int:
             if window <= 0 or not text:
                 continue
 
-            best = None
-            attempts = 0
-            max_attempts = 1 + max(0, args.retakes)
-            while attempts < max_attempts:
-                seed = seeds[attempts % len(seeds)] if seeds else None
-                source_rate, generated = synthesize(args.base_url, text, voice, language, seed)
-                attempts += 1
+            hint = None
+            if args.backchannel_instruct and not hint_disabled and is_backchannel(text, args.backchannel_words):
+                hint = args.backchannel_instruct
+            db_source = None
+            if source_audio is not None:
+                db_source = rms_db(source_audio[int(start * output_rate): int(end * output_rate)])
+
+            takes = []
+            attempt = 0
+            passing = 0
+            max_takes = args.candidates + max(0, args.retakes)
+            while attempt < max_takes and passing < args.candidates:
+                seed = seeds[attempt % len(seeds)] if seeds else None
+                try:
+                    source_rate, generated = synthesize(args.base_url, text, voice, language, seed, hint)
+                except requests.HTTPError as exc:
+                    detail = ""
+                    try:
+                        detail = exc.response.text
+                    except Exception:  # noqa: BLE001 - best effort
+                        detail = str(exc)
+                    if hint and "instruct" in detail.lower() and not hint_disabled:
+                        hint_disabled = True
+                        print(
+                            "  note: this engine rejects raw instructions for built-in voices "
+                            "('Ming IP uses structured controls'); delivery hints disabled for the rest of the run"
+                        )
+                        hint = None
+                        source_rate, generated = synthesize(args.base_url, text, voice, language, seed, None)
+                    else:
+                        raise
+                attempt += 1
+                duration = generated.size / source_rate
                 wer = None
                 if transcriber is not None:
                     wer, _ = transcribe_errors(
                         transcriber, generated, source_rate, text, Path(args.out_dir or "."),
                         args.qa_model, args.qa_device, args.language,
                     )
-                candidate = (wer if wer is not None else 0.0, generated, source_rate, seed, attempts)
-                if best is None or candidate[0] < best[0]:
-                    best = candidate
-                if wer is None or wer <= args.retake_threshold:
+                ok = wer is None or wer <= args.retake_threshold
+                passing += 1 if ok else 0
+                ratio = duration / window
+                db_take = rms_db(generated)
+                energy = abs(db_take - db_source) / 6.0 if db_source is not None else 0.0
+                takes.append(
+                    {
+                        "ok": ok,
+                        "wer": wer,
+                        "audio": generated,
+                        "rate": source_rate,
+                        "seed": seed,
+                        "ratio": ratio,
+                        "db": db_take,
+                        "db_source": db_source,
+                        "score": abs(ratio - 1.0) + args.energy_weight * min(energy, 3.0),
+                        "instruct": hint,
+                    }
+                )
+                if passing >= args.candidates:
                     break
-            if best[4] > 1:
-                retake_count += 1
 
-            natural = prepare_natural_audio(best[1], best[2], output_rate)
+            eligible = [take for take in takes if take["ok"]] or takes
+            best = min(
+                eligible,
+                key=lambda take: (
+                    take["score"] if take["ok"] else 1.0 + (take["wer"] or 0.0),
+                    take["score"],
+                ),
+            )
+            if len(takes) > 1:
+                retake_count += 1
+            if best["instruct"]:
+                instructed += 1
+            ratios.append(best["ratio"])
+            if best["db_source"] is not None:
+                energy_deltas.append(abs(best["db"] - best["db_source"]))
+
+            natural = prepare_natural_audio(best["audio"], best["rate"], output_rate)
+            speed = 1.0
+            if args.fit_pacing and natural.size:
+                speed = float(natural.size / output_rate) / window
+                speed = min(max(speed, args.fit_min), args.fit_max)
+                if abs(speed - 1.0) > 0.005:
+                    from fractions import Fraction
+
+                    fraction = Fraction(speed).limit_denominator(200)
+                    natural = resample_poly(natural, fraction.denominator, fraction.numerator).astype(np.float32)
+                else:
+                    speed = 1.0
             duration = natural.size / output_rate
             generated_segments[stem].append((turn.get("id"), natural))
             timing_records[stem].append(
@@ -210,18 +344,24 @@ def main() -> int:
                     "generated_seconds": round(duration, 3),
                     "natural_end_seconds": round(start + duration, 3),
                     "overrun_seconds": round(max(0.0, duration - window), 3),
-                    "strategy": "natural_speed_no_stretch",
-                    "attempts": best[4],
-                    "qa_wer": round(best[0], 4),
-                    "seed": best[3],
+                    "strategy": "natural_speed_no_stretch" if not args.fit_pacing else f"tempo_fit_{speed:.3f}",
+                    "attempts": len(takes),
+                    "qa_wer": round(best["wer"], 4) if best["wer"] is not None else None,
+                    "seed": best["seed"],
+                    "pacing_ratio": round(best["ratio"], 3),
+                    "energy_delta_db": round(best["db"] - best["db_source"], 2) if best["db_source"] is not None else None,
+                    "selection_score": round(best["score"], 3),
+                    "instruct": best["instruct"],
                 }
             )
             done += 1
             print(
                 f"  [{done}] {stem:<8} src={window:5.2f}s gen={duration:5.2f}s "
-                f"({duration / window:4.2f}x) took={best[4]}"
-                + (f" wer={best[0] * 100:4.1f}%" if transcriber is not None else "")
-                + f" {text[:52]!r}",
+                f"({duration / window:4.2f}x) takes={len(takes)}"
+                + (f" wer={best['wer'] * 100:4.1f}%" if best["wer"] is not None else "")
+                + (f" db={best['db'] - best['db_source']:+.1f}" if best["db_source"] is not None else "")
+                + (" [hint]" if best["instruct"] else "")
+                + f" {text[:44]!r}",
                 flush=True,
             )
 
@@ -269,6 +409,19 @@ def main() -> int:
         "synthesis_seconds": round(synth_seconds, 2),
         "retakes": retake_count,
         "retake_threshold": args.retake_threshold,
+        "candidates": args.candidates,
+        "instructed_turns": instructed,
+        "backchannel_instruct": args.backchannel_instruct or None,
+        "pacing": {
+            "turns": len(ratios),
+            "median_abs_ratio_error": round(float(np.median([abs(value - 1.0) for value in ratios])), 3) if ratios else None,
+            "mean_ratio": round(float(np.mean(ratios)), 3) if ratios else None,
+            "within_10_percent": sum(1 for value in ratios if abs(value - 1.0) <= 0.10),
+        },
+        "energy": {
+            "median_abs_delta_db": round(float(np.median(energy_deltas)), 2) if energy_deltas else None,
+            "stdev_delta_db": round(float(np.std(energy_deltas)), 2) if energy_deltas else None,
+        },
         "outputs": {"mix_wav": mix_wav.name, "mix_mp3": mix_mp3.name, "speaker_one": one.name, "speaker_two": two.name},
         "timing_diagnostics": {
             stem: {
@@ -290,6 +443,16 @@ def main() -> int:
     )
     for stem, diag in diagnostics.items():
         print(f"  {stem}: generated={diag['generated_speech_seconds']}s review={diag['segments_needing_review']}/{diag['segment_count']}")
+    if ratios:
+        within = sum(1 for value in ratios if abs(value - 1.0) <= 0.10)
+        print(
+            f"  pacing: mean_ratio={np.mean(ratios):.3f} median|err|={np.median([abs(v - 1.0) for v in ratios]):.3f} "
+            f"within10%={within}/{len(ratios)}"
+        )
+    if energy_deltas:
+        print(f"  energy: median|delta|={np.median(energy_deltas):.2f} dB stdev={np.std(energy_deltas):.2f} dB")
+    if instructed:
+        print(f"  backchannel hints applied to {instructed} turn(s)")
     print(f"mix: {mix_mp3}")
     return 0
 
