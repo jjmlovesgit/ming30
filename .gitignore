@@ -5,6 +5,11 @@ audio-cpp-win-*.zip
 out/
 cuda13-runtime/
 
+# server runtime state
+server/.ming30-tmp/
+server/voices/
+server/*.log
+
 # python
 __pycache__/
 *.pyc

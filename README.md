@@ -79,6 +79,22 @@ Quality spot-check: every generated WAV (English plain, English `US_James`, Chin
 clone, voice design, streaming) transcribed back **exactly** through audio-tiny's ASR.
 Transcripts do not separate the two checkpoints at this length — judge naturalness by ear.
 
+## Server
+
+`server/` is an OpenAI-compatible adapter over the audio.cpp runtime:
+`/v1/audio/speech` with PCM/WAV streaming, mp3/opus/flac transcoding, a voice
+library with upload endpoints, model aliases and an OpenAI error envelope.
+Details and the env-var reference: [server/README.md](server/README.md).
+
+```powershell
+cd server
+.\run.ps1                                                # backend + adapter
+python scripts\smoke_test.py --reference ..\out\en\en_2.wav
+```
+
+Measured through the adapter on the RTX 5090, warm Q8_0 model: RTF ≈ 0.24
+offline, streaming time-to-first-chunk 0.13–0.32 s, 12/12 smoke checks.
+
 ## Gotchas
 
 - **LM Studio cannot load these GGUFs.** `ming3_audio` / `ming3_tts` are registered only
@@ -92,6 +108,7 @@ Transcripts do not separate the two checkpoints at this length — judge natural
 ## Files
 
 - `RUNNING-ming30.md` — full runbook: both runtime routes, every command, all caveats.
+- `server/` — OpenAI-compatible adapter (FastAPI), smoke test, Dockerfile, client example.
 - `reqs_tts05.json`, `reqs_en2.json`, `reqs_zh.json` — session request examples.
 - `out/` — verification WAVs (gitignored).
 
