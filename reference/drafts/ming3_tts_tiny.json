@@ -1,0 +1,335 @@
+{
+  "schema_version": 1,
+  "family": "ming3_tts_tiny",
+  "display_name": "Ming 3.0 TTS Tiny",
+  "description": "DRAFT for review. Dialogue-capable multilingual TTS: Bailing-MoE-V3 backbone (7.9B total / 1.3B active), flow-matching acoustic head, audio VAE and CAMPPlus speaker conditioning. Adds the upstream multi-speaker `podcast` task, which the 0.5B family does not have.",
+  "category": "tts",
+  "status": "experimental",
+  "tasks": [
+    "tts",
+    "clone",
+    "design"
+  ],
+  "modes": [
+    "offline"
+  ],
+  "languages": [
+    "zh",
+    "en",
+    "ja",
+    "ko",
+    "de",
+    "fr",
+    "es"
+  ],
+  "capabilities": {
+    "tts": [
+      "long_form",
+      "speaker_reference",
+      "style_control",
+      "emotion_control",
+      "built_in_voices",
+      "multi_speaker"
+    ],
+    "clone": [
+      "long_form",
+      "speaker_reference",
+      "style_control",
+      "emotion_control"
+    ],
+    "design": [
+      "voice_design"
+    ]
+  },
+  "runtime": {
+    "tags": [
+      "gguf"
+    ]
+  },
+  "options": {
+    "request": [
+      {
+        "name": "template_name",
+        "type": "enum",
+        "required": false,
+        "description": "Upstream task mode. Defaults to voice_design on the design route, otherwise seed for Chinese/English and multilingual for the other languages. `podcast` is the only multi-speaker mode. NOTE for review: this extends the ming3_tts template set with `seed`, `paralinguistic` and `podcast`; it does not add new audio.cpp tasks.",
+        "values": [
+          "seed",
+          "multilingual",
+          "podcast",
+          "paralinguistic",
+          "basic",
+          "emotion",
+          "dialect",
+          "ip",
+          "voice_design",
+          "freeform"
+        ]
+      },
+      {
+        "name": "language",
+        "type": "string",
+        "required": false,
+        "description": "Target language name or code. Required by multilingual (German, Spanish, French, Korean, Japanese) and honoured by seed, paralinguistic and podcast; ignored by basic, emotion, dialect, ip, voice_design and freeform."
+      },
+      {
+        "name": "instruct",
+        "type": "string",
+        "required": false,
+        "description": "Voice description for voice_design, raw instruction for freeform, and optional raw conditioning for seed/tts. TODO(verify): upstream api.py names this `instruction`; confirm the accepted spelling for this family."
+      },
+      {
+        "name": "instruction_schema",
+        "type": "enum",
+        "required": false,
+        "description": "Structured instruction field language; defaults to en for dialect, otherwise zh.",
+        "values": [
+          "en",
+          "zh"
+        ]
+      },
+      {
+        "name": "speed",
+        "type": "enum",
+        "required": false,
+        "description": "Categorical speaking speed for the basic template, not waveform resampling.",
+        "values": ["慢速", "中速", "快速"]
+      },
+      {
+        "name": "pitch",
+        "type": "enum",
+        "required": false,
+        "description": "Categorical pitch for the basic template.",
+        "values": ["低", "中", "高"]
+      },
+      {
+        "name": "volume",
+        "type": "enum",
+        "required": false,
+        "description": "Categorical volume for the basic template.",
+        "values": ["低", "中", "高"]
+      },
+      {
+        "name": "emotion",
+        "type": "enum",
+        "required": false,
+        "description": "Emotion label for the emotion template. Upstream also accepts English aliases that map onto these labels.",
+        "values": ["中性", "悲伤", "愤怒", "高兴", "惊讶", "恐惧", "厌恶"]
+      },
+      {
+        "name": "dialect",
+        "type": "enum",
+        "required": false,
+        "description": "Dialect for the dialect template. Upstream alias table maps `chuanyu dialect` and `cantonese` onto these labels.",
+        "values": ["川渝话", "广粤话"]
+      },
+      {
+        "name": "voice_id",
+        "type": "enum",
+        "required": false,
+        "description": "Built-in voice for the ip template. TODO(verify): upstream ip ids are not enumerated in task_protocol.py; confirm the published list rather than inheriting the 0.5B four.",
+        "values": [
+          "US_Emma",
+          "US_James",
+          "UK_George",
+          "UK_Charlotte"
+        ]
+      },
+      {
+        "name": "reference_text",
+        "type": "string",
+        "required": false,
+        "description": "Transcript accompanying a single reference voice_ref; enables the acoustic reference prefix."
+      },
+      {
+        "name": "speaker_references",
+        "type": "path_list",
+        "required": false,
+        "description": "PROPOSED. Podcast only: one reference wav per speaker, positional (speaker_1, speaker_2, ...). Upstream requires the count to match the speaker ids used in the script. Alternative accepted names for review: `voice_samples` (MOSS-TTSD convention) or reusing `voice_ref` as a list."
+      },
+      {
+        "name": "speaker_reference_texts",
+        "type": "string_list",
+        "required": false,
+        "description": "PROPOSED. Podcast only: one transcript per speaker reference, positional. Serialised upstream as ` speaker_N:<text>\\n` with a leading space; the runtime must reproduce that form."
+      },
+      {
+        "name": "speaker_embedding_file",
+        "type": "path_list",
+        "required": false,
+        "description": "CAMPPlus embedding file or list, shape [192] or [1, 192]."
+      },
+      {
+        "name": "export_speaker_embedding_file",
+        "type": "path",
+        "required": false,
+        "description": "Export the enabled reference CAMPPlus embedding as F32 Safetensors."
+      },
+      {
+        "name": "use_speaker_embedding",
+        "type": "bool",
+        "required": false,
+        "default": true,
+        "description": "Condition on the reference speaker embedding."
+      },
+      {
+        "name": "zero_speaker_embedding",
+        "type": "bool",
+        "required": false,
+        "default": false,
+        "description": "Use a zero projected speaker row instead of reference conditioning."
+      },
+      {
+        "name": "max_tokens",
+        "type": "int",
+        "required": false,
+        "min": 1,
+        "description": "Maximum generated acoustic patches per fragment. TODO: upstream tiny context is not the 0.5B's 512 positions; set the default after measuring."
+      },
+      {
+        "name": "guidance_scale",
+        "type": "float",
+        "required": false,
+        "default": 2,
+        "description": "Flow guidance (upstream FORMAL_CFG = 2.0)."
+      },
+      {
+        "name": "sigma",
+        "type": "float",
+        "required": false,
+        "default": 0.25,
+        "min": 0,
+        "description": "Flow SDE noise scale (upstream FORMAL_SIGMA = 0.25)."
+      },
+      {
+        "name": "temperature",
+        "type": "float",
+        "required": false,
+        "default": 0,
+        "min": 0,
+        "description": "Flow sampling temperature (upstream FORMAL_TEMPERATURE = 0.0)."
+      },
+      {
+        "name": "flow_steps",
+        "type": "int",
+        "required": false,
+        "default": 10,
+        "min": 1,
+        "description": "Euler steps for the flow head (upstream FORMAL_FLOW_STEPS = 10). Not present in the ming3_tts spec; needed here if the runtime exposes it."
+      },
+      {
+        "name": "seed",
+        "type": "int",
+        "required": false,
+        "default": 1895,
+        "min": 0,
+        "description": "Reference-posterior and generation noise seed. The podcast template must default to 1235 (upstream FORMAL_PODCAST_SEED), so the effective default is per-template."
+      },
+      {
+        "name": "raw_text",
+        "type": "bool",
+        "required": false,
+        "default": false,
+        "description": "Send the text as one fragment without frontend chunking. Must stay off for podcast: dialogue cannot be chunked because speaker ownership depends on the preceding tags."
+      },
+      {
+        "name": "text_chunk_size",
+        "type": "int",
+        "required": false,
+        "min": 1,
+        "description": "Framework long-form chunk budget in Unicode codepoints."
+      },
+      {
+        "name": "text_chunk_mode",
+        "type": "enum",
+        "required": false,
+        "default": "tag_aware",
+        "description": "Framework text chunking policy.",
+        "values": ["default", "tag_aware", "japanese", "endline"]
+      },
+      {
+        "name": "trim_silence",
+        "type": "bool",
+        "required": false,
+        "default": true,
+        "description": "Trim trailing low-energy 100-ms frames per fragment, retaining a 300-ms tail."
+      }
+    ],
+    "session": [
+      {
+        "name": "reference_cache",
+        "type": "bool",
+        "required": false,
+        "default": true,
+        "description": "Reuse prepared conditioning for the most recently used reference waveform. For podcast this must be keyed on the whole reference set, not one file."
+      }
+    ],
+    "load": []
+  },
+  "package_defaults": {
+    "download": {
+      "kind": "huggingface_snapshot",
+      "repo": "TODO/DECIDE  (no public GGUF host exists yet; audio-cpp/Ming-3.0-TTS-Tiny-GGUF is the natural home)",
+      "revision": "main",
+      "gated": false
+    }
+  },
+  "packages": [
+    {
+      "id": "ming_3_0_tts_tiny_bf16",
+      "display_name": "Ming 3.0 TTS Tiny BF16",
+      "format": "gguf",
+      "precision": "bf16",
+      "default": true,
+      "target_directory": "Ming-3.0-TTS-Tiny-GGUF",
+      "files": ["ming-3.0-tts-tiny-bf16.gguf"]
+    },
+    {
+      "id": "ming_3_0_tts_tiny_q8_0",
+      "display_name": "Ming 3.0 TTS Tiny Q8_0",
+      "format": "gguf",
+      "precision": "q8_0",
+      "default": false,
+      "target_directory": "Ming-3.0-TTS-Tiny-GGUF",
+      "files": ["ming-3.0-tts-tiny-q8_0.gguf"]
+    }
+  ],
+  "dependencies": [],
+  "ui": {
+    "recommended_package": "ming_3_0_tts_tiny_bf16",
+    "tags": ["TTS", "Dialogue", "GGUF"],
+    "docs": ["docs/models/ming3_tts_tiny.md"]
+  },
+  "sources": [
+    {
+      "format": "gguf",
+      "roots": {
+        "model": ".",
+        "weights": "$gguf"
+      },
+      "files": {
+        "config": "model:config.json",
+        "tokenizer_json": "model:tokenizer.json",
+        "tokenizer_config": "model:tokenizer_config.json"
+      },
+      "tensors": {
+        "thinker": {
+          "source": "weights:",
+          "prefix": "thinker"
+        },
+        "talker": {
+          "source": "weights:",
+          "prefix": "talker"
+        },
+        "vae": {
+          "source": "weights:",
+          "prefix": "vae"
+        },
+        "speaker": {
+          "source": "weights:",
+          "prefix": "speaker"
+        }
+      }
+    }
+  ]
+}
