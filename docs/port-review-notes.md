@@ -1,8 +1,9 @@
 # Notes for the audio.cpp maintainers — Ming 3.0 TTS Tiny port
 
-Status: **pre-port, asking for direction.** No PR is open, nothing is pushed to
-`0xShug0/audio.cpp`. This file records what we found, what we propose, and the
-questions we need answered before writing C++ that you would have to review.
+Status: **internal, not yet sent.** No PR is open, nothing is pushed to
+`0xShug0/audio.cpp`. Per decision D9 in `port-decisions.md`, the maintainers are
+not contacted until the success gate passes; the questions below have been answered
+internally for now and this file becomes the hand-over record afterwards.
 
 Prepared 2026-10-26 against `main` @ `41c1f8ff` (v0.9.3).
 

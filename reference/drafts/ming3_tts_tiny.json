@@ -52,7 +52,7 @@
         "name": "template_name",
         "type": "enum",
         "required": false,
-        "description": "Upstream task mode. Defaults to voice_design on the design route, otherwise seed for Chinese/English and multilingual for the other languages. `podcast` is the only multi-speaker mode. NOTE for review: this extends the ming3_tts template set with `seed`, `paralinguistic` and `podcast`; it does not add new audio.cpp tasks.",
+        "description": "Upstream task mode (decision D1: template values, no new audio.cpp task). Defaults to voice_design on the design route, otherwise seed for Chinese/English and multilingual for the other languages. `podcast` is the only multi-speaker mode.",
         "values": [
           "seed",
           "multilingual",
@@ -76,7 +76,7 @@
         "name": "instruct",
         "type": "string",
         "required": false,
-        "description": "Voice description for voice_design, raw instruction for freeform, and optional raw conditioning for seed/tts. TODO(verify): upstream api.py names this `instruction`; confirm the accepted spelling for this family."
+        "description": "Voice description for voice_design, raw instruction for freeform, optional raw conditioning for seed/tts. audio.cpp names this `instruct`; upstream calls it `instruction` - the family maps one onto the other so existing clients keep working."
       },
       {
         "name": "instruction_schema",
@@ -93,35 +93,58 @@
         "type": "enum",
         "required": false,
         "description": "Categorical speaking speed for the basic template, not waveform resampling.",
-        "values": ["慢速", "中速", "快速"]
+        "values": [
+          "慢速",
+          "中速",
+          "快速"
+        ]
       },
       {
         "name": "pitch",
         "type": "enum",
         "required": false,
         "description": "Categorical pitch for the basic template.",
-        "values": ["低", "中", "高"]
+        "values": [
+          "低",
+          "中",
+          "高"
+        ]
       },
       {
         "name": "volume",
         "type": "enum",
         "required": false,
         "description": "Categorical volume for the basic template.",
-        "values": ["低", "中", "高"]
+        "values": [
+          "低",
+          "中",
+          "高"
+        ]
       },
       {
         "name": "emotion",
         "type": "enum",
         "required": false,
         "description": "Emotion label for the emotion template. Upstream also accepts English aliases that map onto these labels.",
-        "values": ["中性", "悲伤", "愤怒", "高兴", "惊讶", "恐惧", "厌恶"]
+        "values": [
+          "中性",
+          "悲伤",
+          "愤怒",
+          "高兴",
+          "惊讶",
+          "恐惧",
+          "厌恶"
+        ]
       },
       {
         "name": "dialect",
         "type": "enum",
         "required": false,
         "description": "Dialect for the dialect template. Upstream alias table maps `chuanyu dialect` and `cantonese` onto these labels.",
-        "values": ["川渝话", "广粤话"]
+        "values": [
+          "川渝话",
+          "广粤话"
+        ]
       },
       {
         "name": "voice_id",
@@ -136,22 +159,16 @@
         ]
       },
       {
+        "name": "voice_samples",
+        "type": "path_list",
+        "required": false,
+        "description": "Podcast only: positional reference wavs, one per speaker (speaker_1, speaker_2, ...). Mirrors the moss_ttsd convention instead of new option names (decision D2). The count must match the speaker ids used in the script."
+      },
+      {
         "name": "reference_text",
         "type": "string",
         "required": false,
-        "description": "Transcript accompanying a single reference voice_ref; enables the acoustic reference prefix."
-      },
-      {
-        "name": "speaker_references",
-        "type": "path_list",
-        "required": false,
-        "description": "PROPOSED. Podcast only: one reference wav per speaker, positional (speaker_1, speaker_2, ...). Upstream requires the count to match the speaker ids used in the script. Alternative accepted names for review: `voice_samples` (MOSS-TTSD convention) or reusing `voice_ref` as a list."
-      },
-      {
-        "name": "speaker_reference_texts",
-        "type": "string_list",
-        "required": false,
-        "description": "PROPOSED. Podcast only: one transcript per speaker reference, positional. Serialised upstream as ` speaker_N:<text>\\n` with a leading space; the runtime must reproduce that form."
+        "description": "Transcript accompanying the reference audio, enabling the acoustic prefix. For podcast this is the tagged multi-speaker transcript serialised as ' speaker_N:<text>\\n' (leading space per line), matching upstream. Decision D2."
       },
       {
         "name": "speaker_embedding_file",
@@ -245,7 +262,12 @@
         "required": false,
         "default": "tag_aware",
         "description": "Framework text chunking policy.",
-        "values": ["default", "tag_aware", "japanese", "endline"]
+        "values": [
+          "default",
+          "tag_aware",
+          "japanese",
+          "endline"
+        ]
       },
       {
         "name": "trim_silence",
@@ -262,6 +284,17 @@
         "required": false,
         "default": true,
         "description": "Reuse prepared conditioning for the most recently used reference waveform. For podcast this must be keyed on the whole reference set, not one file."
+      },
+      {
+        "name": "parity",
+        "type": "enum",
+        "required": false,
+        "default": "reference",
+        "values": [
+          "reference",
+          "fast"
+        ],
+        "description": "Numerics profile (decision D6). `reference` pins SDPA attention and the non-fused KDA recurrence, matching upstream's formal environment (BAILING_KDA_FUSED_RECURRENT=0, BAILING_MLA_ATTN=sdpa, MING_TINY_AUDIO_VAE_ATTN=sdpa). `fast` uses the optimised path and is only valid once parity has been demonstrated."
       }
     ],
     "load": []
@@ -269,7 +302,7 @@
   "package_defaults": {
     "download": {
       "kind": "huggingface_snapshot",
-      "repo": "TODO/DECIDE  (no public GGUF host exists yet; audio-cpp/Ming-3.0-TTS-Tiny-GGUF is the natural home)",
+      "repo": "jjmlovesgit/Ming-3.0-TTS-Tiny-GGUF  (decision D7: we host until a port is accepted upstream)",
       "revision": "main",
       "gated": false
     }
@@ -280,25 +313,35 @@
       "display_name": "Ming 3.0 TTS Tiny BF16",
       "format": "gguf",
       "precision": "bf16",
-      "default": true,
+      "default": false,
       "target_directory": "Ming-3.0-TTS-Tiny-GGUF",
-      "files": ["ming-3.0-tts-tiny-bf16.gguf"]
+      "files": [
+        "ming-3.0-tts-tiny-bf16.gguf"
+      ]
     },
     {
       "id": "ming_3_0_tts_tiny_q8_0",
       "display_name": "Ming 3.0 TTS Tiny Q8_0",
       "format": "gguf",
       "precision": "q8_0",
-      "default": false,
+      "default": true,
       "target_directory": "Ming-3.0-TTS-Tiny-GGUF",
-      "files": ["ming-3.0-tts-tiny-q8_0.gguf"]
+      "files": [
+        "ming-3.0-tts-tiny-q8_0.gguf"
+      ]
     }
   ],
   "dependencies": [],
   "ui": {
-    "recommended_package": "ming_3_0_tts_tiny_bf16",
-    "tags": ["TTS", "Dialogue", "GGUF"],
-    "docs": ["docs/models/ming3_tts_tiny.md"]
+    "recommended_package": "ming_3_0_tts_tiny_q8_0",
+    "tags": [
+      "TTS",
+      "Dialogue",
+      "GGUF"
+    ],
+    "docs": [
+      "docs/models/ming3_tts_tiny.md"
+    ]
   },
   "sources": [
     {
