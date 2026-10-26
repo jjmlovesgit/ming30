@@ -89,17 +89,15 @@ env-var reference: [server/README.md](server/README.md).
 
 ```powershell
 cd server
-.\run.ps1                                                # backend + adapter
+.\run.cmd                                                # engine + adapter, no Docker
 python scripts\smoke_test.py --reference ..\out\en\en_2.wav
 ```
 
-Or the whole stack in containers — `compose.yaml` at the root builds the native
-engine (CUDA) plus the adapter:
-
-```bash
-cp .env.example .env
-docker compose up --build
-```
+`run.cmd` exists because the default Windows execution policy blocks unsigned
+`.ps1` files; `scripts\preflight.py` checks the engine binary, CUDA DLLs, GPU,
+GGUFs, python deps and ports before you start. The identical stack is also
+described for containers in `compose.yaml`, but that path is untested here —
+the native one is what was verified.
 
 Measured through the adapter on the RTX 5090, warm Q8_0 model: RTF ≈ 0.24
 offline, streaming time-to-first-chunk 0.13–0.32 s, transcription ~0.1 s for

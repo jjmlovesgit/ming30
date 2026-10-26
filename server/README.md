@@ -23,26 +23,53 @@ OpenAI client ──▶ ming30 adapter (:8070) ──▶ audiocpp_server (:8090)
                         └─ .ming30-tmp/ (ffmpeg scratch)
 ```
 
-## Quick start
+## Quick start (no Docker)
+
+Two native processes: `audiocpp_server` holds the models warm, this adapter serves
+HTTP. Nothing needs a container runtime.
 
 ```powershell
-# 1. runtime + model (see ../RUNNING-ming30.md)
-#    audio.cpp-0.9.3-cuda12.4\  and  models\ming3-tts\ming-3.0-tts-0.5b-q8_0.gguf
-
-# 2. both processes, Ctrl+C stops them
 cd server
-.\run.ps1
 
-# 3. verify
+# 1. check the machine: engine binary, CUDA DLLs, GPU, both GGUFs, python deps, ports
+python scripts\preflight.py
+
+# 2. start engine + adapter; Ctrl+C stops both
+.\run.cmd
+
+# 3. in another shell, verify the whole surface
 python scripts\smoke_test.py --reference ..\out\en\en_2.wav
 ```
 
-`run.ps1` starts `audiocpp_server` with `config/dev.server.json` (an offline entry
-`ming-tts` and a streaming entry `ming-tts-stream`), waits for `/health`, then
-starts the adapter. The CUDA toolkit `bin` is prepended to `PATH` because
-`ggml-cuda.dll` needs `cublas64_12` / `cufft64_11` from the 12.9 toolkit.
+`run.cmd` is a thin launcher for `run.ps1` with `-ExecutionPolicy Bypass`, because
+the default Windows policy refuses to run unsigned `.ps1` files. If you prefer
+PowerShell directly:
 
-Adapter only, backend already running: `.\run.ps1 -AdapterOnly`.
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+What it does: starts `audiocpp_server` with `config/dev.server.json` (offline
+`ming-tts`, streaming `ming-tts-stream`, transcription `ming-asr`), waits for
+`/health`, prints the model ids, then starts the adapter. The CUDA toolkit `bin` is
+prepended to `PATH` because `ggml-cuda.dll` needs `cublas64_12` / `cufft64_11` from
+the 12.9 toolkit — without it the engine exits `0xC0000135`.
+
+Adapter only, engine already running: `.\run.cmd -AdapterOnly`.
+The adapter needs a Python that can import `fastapi`/`uvicorn`/`httpx`/`multipart`;
+`run.ps1` probes `python`, then `py -3.12`, `py -3.11`, `py -3.10`, and takes the
+first that works. Override with `-PythonPath C:\path\to\python.exe` or
+`MING30_PYTHON`.
+
+Expected startup output:
+
+```
+engine : C:\...\audio.cpp-0.9.3-cuda12.4\audiocpp_server.exe
+config : C:\...\server\config\dev.server.json
+engine : ready, audio.cpp 0.9.3, 3 models
+models : ming-tts, ming-tts-stream, ming-asr
+adapter: http://127.0.0.1:8070  (py -3.12)
+```
 
 ## API
 
@@ -123,7 +150,11 @@ the native route always answers JSON regardless of `response_format`.
 `model="whisper-1"` is accepted for SDK compatibility and maps to the configured
 ASR entry; any other value is ignored.
 
-## Docker
+## Docker (optional)
+
+`compose.yaml` at the repository root runs the same two processes in containers.
+The native path above is the supported one for now; this exists for hosts where
+containers are the norm.
 
 `compose.yaml` at the repository root runs the whole stack: the native engine in a
 CUDA image plus this adapter.
