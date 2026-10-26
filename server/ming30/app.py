@@ -206,8 +206,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # -- voices --------------------------------------------------------
     @app.get("/v1/audio/voices")
     async def list_voices():
-        voices = [voice.to_json() for voice in app.state.voices.list()]
-        return {"object": "list", "data": voices}
+        items = []
+        for voice in app.state.voices.list():
+            item = voice.to_json()
+            # Older audio.cpp-style clients read `voice_id` from a `voices` array;
+            # newer OpenAI-style clients read `id` from `data`. Serve both.
+            item["voice_id"] = item["id"]
+            items.append(item)
+        return {"object": "list", "data": items, "voices": items}
 
     @app.post("/v1/audio/voices", status_code=201)
     async def create_voice(

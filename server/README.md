@@ -84,6 +84,20 @@ adapter: http://127.0.0.1:8070  (py -3.12)
 | `POST` | `/v1/audio/speech` | the main route; JSON in, audio out |
 | `POST` | `/v1/audio/transcriptions` | multipart WAV in; `json`, `text`, `srt`, `vtt`, `verbose_json` out |
 
+`GET /v1/audio/voices` serves both client generations: OpenAI-style `data[].id`
+and the `voices[].voice_id` array that audio.cpp-style clients read.
+
+## Voice swap (SAM_fastapi integration)
+
+`scripts/ming_voice_swap.py` re-voices an already-processed
+[SAM_fastapi](https://github.com/jjmlovesgit) run — separated stems plus
+word-timed transcripts — reusing that project's turn builder, gap-preserving
+scheduler, mixer and mp3 encoder, and swapping only the TTS client. With per-turn
+QA retakes it reaches **98.2% word match** on the 6:52 NotebookLM test podcast,
+against the PocketTTS baseline's published 98.1%.
+
+Full pipeline, numbers and caveats: [../docs/voice-swap-poc.md](../docs/voice-swap-poc.md).
+
 `POST /v1/audio/speech` accepts:
 
 ```json

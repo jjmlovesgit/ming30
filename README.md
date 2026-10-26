@@ -101,7 +101,11 @@ the native one is what was verified.
 
 Measured through the adapter on the RTX 5090, warm Q8_0 model: RTF ≈ 0.24
 offline, streaming time-to-first-chunk 0.13–0.32 s, transcription ~0.1 s for
-4.5 s of audio, 14/14 smoke checks. The compose stack itself is untested here
+4.5 s of audio, 14/14 smoke checks.
+
+**Voice-swap POC:** a 6:52 two-speaker NotebookLM podcast re-voiced through an
+existing SAM_fastapi run (stems + editorial script reused) scores **98.2% word
+match** with per-turn QA retakes. See [docs/voice-swap-poc.md](docs/voice-swap-poc.md). The compose stack itself is untested here
 (Docker is not installed on this machine); the Windows engine path is what was
 verified.
 
