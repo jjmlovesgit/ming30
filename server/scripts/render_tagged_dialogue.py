@@ -25,7 +25,7 @@ import soundfile as sf
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", default="http://127.0.0.1:8090")
-    parser.add_argument("--model", default="moss-ttsd"  # any configured family id)
+    parser.add_argument("--model", default="moss-ttsd")  # any configured dialogue family id
     parser.add_argument("--text", required=True, help="file with the [S1]/[S2] tagged script")
     parser.add_argument("--out", required=True)
     parser.add_argument("--ref-one", default="", help="reference wav for [S1]")
