@@ -1,0 +1,17 @@
+# local artifacts
+models/
+audio.cpp-0.9.3*/
+audio-cpp-win-*.zip
+out/
+cuda13-runtime/
+
+# python
+__pycache__/
+*.pyc
+.venv*/
+
+# editors / os
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

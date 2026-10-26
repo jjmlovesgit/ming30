@@ -1,0 +1,9 @@
+{"requests":[
+ {"id":"en_3","audio":"out/tts05/en_3.wav"},
+ {"id":"en_four","audio":"out/tts05/en_four.wav"},
+ {"id":"en_ip_james","audio":"out/tts05/en_ip_james.wav"},
+ {"id":"zh_1","audio":"out/tts05/zh_1.wav"},
+ {"id":"zh_2","audio":"out/tts05/zh_2.wav"},
+ {"id":"clone_05","audio":"out/clone_05.wav"},
+ {"id":"load_probe","audio":"out/tts05/load_probe.wav"}
+]}

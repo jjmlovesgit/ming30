@@ -1,0 +1,6 @@
+{"requests":[
+ {"id":"tiny_en_3","audio":"out/en/en_3.wav"},
+ {"id":"tiny_clone_en","audio":"out/clone_en.wav"},
+ {"id":"vdes_05","audio":"out/vdes_05.wav"},
+ {"id":"stream_05","audio":"out/stream_05.wav"}
+]}

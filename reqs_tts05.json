@@ -1,0 +1,7 @@
+{"requests":[
+ {"id":"en_3","text":"The garden will remain open until sunset, provided the weather stays clear.","language":"en"},
+ {"id":"en_four","text":"The reading room closes at six, so please return the keys before then.","language":"en"},
+ {"id":"en_ip_james","text":"The garden will remain open until sunset, provided the weather stays clear.","language":"en","template_name":"ip","voice_id":"US_James"},
+ {"id":"zh_1","text":"傍晚的风从山口吹过来，远处的云慢慢染成了金色。","language":"zh"},
+ {"id":"zh_2","text":"今天下午三点，我们在二楼会议室讨论下个季度的预算。","language":"zh"}
+]}
