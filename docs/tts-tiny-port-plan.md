@@ -1,4 +1,4 @@
-# Porting Ming-3.0-tts-tiny into audio.cpp — plan
+﻿# Porting Ming-3.0-tts-tiny into audio.cpp â€” plan
 
 Goal: get the `podcast` task (speaker-tagged dialogue with per-speaker references,
 one generation pass) running on this machine, in the runtime we already use.
@@ -7,6 +7,31 @@ The blocker was never VRAM. It is that upstream shipped tiny for a Linux PyTorch
 stack, and no GGUF/Windows port exists (verified: HF search `ming gguf` returns
 only TTS-0.5B and Audio-Tiny; `audio-cpp/audio.cpp-gguf` has no tts-tiny files;
 the only working conversions are MLX/CoreAI for Apple Silicon).
+
+## Status: checkout refreshed and build verified (2026-10-26)
+
+| step | result |
+|---|---|
+| `git fetch origin` | `origin/main` = `41c1f8ff` (v0.9.3, 2026-10-26); 1,052 commits ahead of `release-0.1` |
+| branch | `ming3-tts-tiny` from `origin/main`; `release-0.1` untouched, 4 untracked files preserved |
+| build | `scripts\build_windows.cmd -Preset windows-cuda-release -Target audiocpp_cli -ModelSet custom -Models ming3_tts,ming3_audio` â†’ 392/392, exit 0 |
+| binary | `build\windows-cuda-release\bin\audiocpp_cli.exe` â€” `audio.cpp dev`, `git 41c1f8ff`, backends `cpu,cuda` |
+| inference | Ming 0.5B GGUF through the from-source binary: 1.60 s audio, RTF 0.34 |
+| registry | `--list-loaders` reports `ming3_tts` and `ming3_audio` (custom model set) |
+| specs in tree | `model_specs/ming3_tts.json` (9.7 KB), `model_specs/ming3_audio.json` (29.5 KB) |
+
+Two things learned that matter for port work:
+
+- **A `dev` build has no compiled model specs.** `--list-loaders` fails from an
+  arbitrary working directory with *"model contract spec not found for family
+  'ming3_tts'"*; run from the repo root so `model_specs/` is found, or pass
+  `--model-spec-override`. Inference alone still works because the released GGUF
+  embeds its spec.
+- **`audiocpp_server.exe` was not rebuilt** (target was `audiocpp_cli` only); it is
+  still the July binary. Rebuild with `-Target audiocpp_server` when needed, and
+  build `audiocpp_gguf` before conversion work.
+
+
 
 ## Why it is tractable
 
@@ -25,8 +50,8 @@ already ships (`ming3_tts` = 0.5B, `ming3_audio` = Audio Tiny):
 | `spk_head`, `stop_head` | 4 tensors, small projections | analogous heads exist in both families | wire up |
 | **prompt/task contract** | 9 tasks incl. `podcast` | 0.5B has 8 tasks, **no podcast** | **new** |
 
-Tensor prefixes are unambiguous: `model.model.*` 9,282 · `audio.encoder` 348 ·
-`audio.decoder` 295 · `flowloss.cfm` 236 · `linear_proj_audio.*` 119 ·
+Tensor prefixes are unambiguous: `model.model.*` 9,282 Â· `audio.encoder` 348 Â·
+`audio.decoder` 295 Â· `flowloss.cfm` 236 Â· `linear_proj_audio.*` 119 Â·
 `spk_head`/`stop_head` 4.
 
 The conversion path is also favourable: `convert_ming3_tts_gguf.py` is a thin
@@ -38,15 +63,15 @@ prefixes), so much of a port is spec plus the C++ name mapping.
 
 | # | item | where | rough size |
 |---|---|---|---|
-| 1 | refresh checkout: `release-0.1` @ `acde132` (2026-07-02) → current `main` (v0.9.3), rebuild | their repo | hours; toolchain already proven (`windows-cuda-release`, arch `120a-real`) |
+| 1 | refresh checkout: `release-0.1` @ `acde132` (2026-07-02) â†’ current `main` (v0.9.3), rebuild | their repo | hours; toolchain already proven (`windows-cuda-release`, arch `120a-real`) |
 | 2 | fetch checkpoint | `inclusionAI/Ming-3.0-tts-tiny` | 30 shards, ~16 GB bf16 |
-| 3 | `model_specs/ming3_tts_tiny.json` (spec v1: tasks incl. `podcast`, options, packages, sources) | audio.cpp tree | 1–2 days |
-| 4 | conversion mapping in `audiocpp_gguf`: 9,282 backbone tensors, expert banks (128 experts stacked, routers F32), heads | C++ | 3–5 days |
-| 5 | family runtime: reuse Audio Tiny's MoE/KDA/MLA graph, 0.5B's CFM/DiT/VAE, wire `spk_head`/`stop_head` | C++ | 1–2 weeks |
-| 6 | prompt contracts: 8 existing tasks + `podcast` (speaker tags, per-speaker references) | C++/spec | 3–5 days, plus iteration |
-| 7 | validation: parity vs the official Python runtime, RTF/VRAM, docs page, license row, path tests | tests/docs | 2–3 days |
+| 3 | `model_specs/ming3_tts_tiny.json` (spec v1: tasks incl. `podcast`, options, packages, sources) | audio.cpp tree | 1â€“2 days |
+| 4 | conversion mapping in `audiocpp_gguf`: 9,282 backbone tensors, expert banks (128 experts stacked, routers F32), heads | C++ | 3â€“5 days |
+| 5 | family runtime: reuse Audio Tiny's MoE/KDA/MLA graph, 0.5B's CFM/DiT/VAE, wire `spk_head`/`stop_head` | C++ | 1â€“2 weeks |
+| 6 | prompt contracts: 8 existing tasks + `podcast` (speaker tags, per-speaker references) | C++/spec | 3â€“5 days, plus iteration |
+| 7 | validation: parity vs the official Python runtime, RTF/VRAM, docs page, license row, path tests | tests/docs | 2â€“3 days |
 
-Total: **4–6 weeks** for one person working outside the codebase, with item 6 as
+Total: **4â€“6 weeks** for one person working outside the codebase, with item 6 as
 the uncertainty (their own 0.5B port needed follow-up PRs #1020/#1021/#1034 for
 language, chunking and text splitting before it was right).
 
@@ -61,7 +86,7 @@ language, chunking and text splitting before it was right).
   Audio Tiny's Thinker; the MoE path must be parameterised, not copied.
 - **Quantisation of the small heads.** MOSS-TTSD's lesson (`lm_heads` at q4_k ends
   turns early): keep `stop_head`/`spk_head` at bf16 or f32 in the package.
-- **Tokenizer.** vocab 157,184 plus the Bailing chat template — the prompt
+- **Tokenizer.** vocab 157,184 plus the Bailing chat template â€” the prompt
   assembly uses `<role>` tags, not Qwen's `<|im_start|>`.
 - **Context.** The 0.5B has a 512-position output budget; tiny's dialogue takes
   need their own limit or the podcast take will truncate mid-turn.
@@ -115,11 +140,12 @@ audiocpp_cli --family ming3_tts_tiny --task tts --backend cuda `
 ## What can be done before the weights land
 
 1. **Refresh and build** the checkout (validates the toolchain against Ming-era
-   code — the current tree predates `ming3_audio`, so this alone is informative).
+   code â€” the current tree predates `ming3_audio`, so this alone is informative).
 2. **Write the spec + converter**, tested as far as a dry run on the weight index
    allows (tensor names, dtypes, expert stacking order).
 3. **Extract the prompt contracts** from `ming_tiny/task_protocol.py` and
    `prompt_contract.py` into a test fixture set, so the C++ side has something to
    match on the first run.
-4. **File the upstream issue** with this table — if the maintainers take it, the
+4. **File the upstream issue** with this table â€” if the maintainers take it, the
    port lands faster and maintained.
+
