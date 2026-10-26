@@ -51,18 +51,25 @@ def synthesize(
     language: str,
     seed: int | None,
     instruct: str | None = None,
+    *,
+    model: str = "tts-1",
+    native_voice: bool = False,
 ) -> tuple[int, np.ndarray]:
-    """One TTS request through the OpenAI-shaped adapter, optionally seed-pinned."""
+    """One TTS request, either through the adapter or straight to the engine.
 
-    payload: dict = {
-        "model": "tts-1",
-        "input": text,
-        "voice": voice,
-        "response_format": "wav",
-        "language": language,
-    }
+    ``native_voice`` targets an audio.cpp model id directly and passes the speaker
+    as ``options.voice_id`` instead of the adapter's built-in `ip` template.
+    """
+
+    payload: dict = {"model": model, "input": text, "response_format": "wav"}
+    options = {"language": language}
+    if native_voice:
+        options["voice_id"] = voice
+    else:
+        payload["voice"] = voice
     if seed is not None:
-        payload["options"] = {"seed": seed}
+        options["seed"] = seed
+    payload["options"] = options
     if instruct:
         payload["instructions"] = instruct
     response = requests.post(f"{base_url.rstrip('/')}/v1/audio/speech", json=payload, timeout=600)
@@ -130,6 +137,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8070")
+    parser.add_argument("--engine-url", default="", help="talk to the engine directly instead of the adapter")
+    parser.add_argument("--model", default="tts-1", help="engine model id (with --engine-url)")
+    parser.add_argument("--native-voice", action="store_true", help="pass the speaker as options.voice_id")
     parser.add_argument("--voice-one", default="US_James")
     parser.add_argument("--voice-two", default="US_Emma")
     parser.add_argument("--language", default="en")
@@ -194,11 +204,14 @@ def main() -> int:
     print(f"turns: {counts} total={sum(counts.values())}")
 
     client = PocketTTSClient(args.base_url)
-    voices = {item.get("voice_id") for item in client.list_voices()}
-    for voice in (args.voice_one, args.voice_two):
-        if voice not in voices:
-            print(f"voice '{voice}' not offered by {args.base_url}: {sorted(v for v in voices if v)}", file=sys.stderr)
-            return 4
+    if args.native_voice:
+        print(f"engine: {args.engine_url or args.base_url} model={args.model} (native voice ids, adapter skipped)")
+    else:
+        voices = {item.get("voice_id") for item in client.list_voices()}
+        for voice in (args.voice_one, args.voice_two):
+            if voice not in voices:
+                print(f"voice '{voice}' not offered by {args.base_url}: {sorted(v for v in voices if v)}", file=sys.stderr)
+                return 4
 
     assignments = (
         ("target", args.voice_one),
@@ -254,7 +267,16 @@ def main() -> int:
             while attempt < max_takes and passing < args.candidates:
                 seed = seeds[attempt % len(seeds)] if seeds else None
                 try:
-                    source_rate, generated = synthesize(args.base_url, text, voice, language, seed, hint)
+                    source_rate, generated = synthesize(
+                        args.engine_url or args.base_url,
+                        text,
+                        voice,
+                        language,
+                        seed,
+                        hint,
+                        model=args.model,
+                        native_voice=args.native_voice,
+                    )
                 except requests.HTTPError as exc:
                     detail = ""
                     try:
@@ -268,7 +290,16 @@ def main() -> int:
                             "('Ming IP uses structured controls'); delivery hints disabled for the rest of the run"
                         )
                         hint = None
-                        source_rate, generated = synthesize(args.base_url, text, voice, language, seed, None)
+                        source_rate, generated = synthesize(
+                            args.engine_url or args.base_url,
+                            text,
+                            voice,
+                            language,
+                            seed,
+                            None,
+                            model=args.model,
+                            native_voice=args.native_voice,
+                        )
                     else:
                         raise
                 attempt += 1
