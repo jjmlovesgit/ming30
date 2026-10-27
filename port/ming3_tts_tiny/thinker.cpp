@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <numeric>
@@ -114,7 +115,7 @@ struct Routing {
 // KDA attention for one layer: float32 recurrence. The reference uses FLA's chunk
 // path; the two agree to float32 precision on these inputs.
 void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<float> & input, size_t tokens,
-    std::vector<float> & output) {
+    std::vector<float> & output, std::vector<float> & attn_only) {
     const auto & source = *assets.weights;
     const size_t hidden = static_cast<size_t>(assets.config.hidden_size);
     const std::string prefix = layer_prefix(layer);
@@ -137,6 +138,7 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
     const auto o_norm_w = load_float(source, prefix + "attention.o_norm.weight", {static_cast<int64_t>(kHeadDim)});
     const auto o_w = load_float(source, prefix + "attention.o_proj.weight", {static_cast<int64_t>(hidden), static_cast<int64_t>(kProjection)});
 
+    attn_only.assign(tokens * hidden, 0.0f);
     std::vector<float> q_all(tokens * kProjection), k_all(tokens * kProjection), v_all(tokens * kProjection);
     std::vector<float> q_row(kProjection), k_row(kProjection), v_row(kProjection);
     for (size_t time = 0; time < tokens; ++time) {
@@ -223,6 +225,7 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
         }
         linear(gated.data(), o_w.data(), kProjection, hidden, attn.data());
         for (size_t column = 0; column < hidden; ++column) {
+            attn_only[time * hidden + column] = attn[column];
             fused[time * hidden + column] = input[time * hidden + column] + attn[column];
         }
     }
@@ -232,7 +235,7 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
 // MLA attention: LoRA q/kv projections, interleaved RoPE on the 64-dim slice, causal
 // SDPA, head-wise sigmoid output gate, then the dense projection.
 void run_mla(const MingTinyAssets & assets, size_t layer, const std::vector<float> & input, size_t tokens,
-    std::vector<float> & output) {
+    std::vector<float> & output, std::vector<float> & attn_only) {
     const auto & source = *assets.weights;
     const size_t hidden = static_cast<size_t>(assets.config.hidden_size);
     const size_t heads = kHeads;
@@ -253,6 +256,7 @@ void run_mla(const MingTinyAssets & assets, size_t layer, const std::vector<floa
 
     std::vector<float> normed;
     rms_norm(input.data(), norm_w.data(), tokens, hidden, normed);
+    attn_only.assign(tokens * hidden, 0.0f);
 
     std::vector<float> q_all(tokens * heads * qk_head, 0.0f);
     std::vector<float> k_all(tokens * heads * qk_head, 0.0f);
@@ -346,6 +350,7 @@ void run_mla(const MingTinyAssets & assets, size_t layer, const std::vector<floa
         }
         linear(gated.data(), dense.data(), heads * v_head, hidden, attn.data());
         for (size_t column = 0; column < hidden; ++column) {
+            attn_only[time * hidden + column] = attn[column];
             fused[time * hidden + column] = input[time * hidden + column] + attn[column];
         }
     }
@@ -382,7 +387,8 @@ void run_dense_mlp(const MingTinyAssets & assets, size_t layer, const std::vecto
 // MoE block: sigmoid gate + expert bias, group-limited top-k, routed experts from the
 // stacked banks, and the shared expert applied to the same normed input.
 void run_moe(const MingTinyAssets & assets, size_t layer, const std::vector<float> & input, size_t tokens,
-    std::vector<float> & output, Routing & routing) {
+    std::vector<float> & output, Routing & routing, std::vector<float> & pre_router,
+    std::vector<float> & router_scores) {
     const auto & source = *assets.weights;
     const size_t hidden = static_cast<size_t>(assets.config.hidden_size);
     const size_t intermediate = 512;
@@ -408,6 +414,8 @@ void run_moe(const MingTinyAssets & assets, size_t layer, const std::vector<floa
 
     std::vector<float> normed;
     rms_norm(input.data(), post.data(), tokens, hidden, normed);
+    pre_router = normed;
+    router_scores.assign(tokens * experts, 0.0f);
     routing.ids.assign(tokens * kTopK, 0);
     routing.weights.assign(tokens * kTopK, 0.0f);
     output.assign(input.size(), 0.0f);
@@ -418,7 +426,10 @@ void run_moe(const MingTinyAssets & assets, size_t layer, const std::vector<floa
     for (size_t time = 0; time < tokens; ++time) {
         const float * row = normed.data() + time * hidden;
         linear(row, gate_w.data(), hidden, experts, logits.data());
-        for (size_t expert = 0; expert < experts; ++expert) scores[expert] = sigmoid(logits[expert]);
+        for (size_t expert = 0; expert < experts; ++expert) {
+            scores[expert] = sigmoid(logits[expert]);
+            router_scores[time * experts + expert] = scores[expert];
+        }
 
         std::vector<std::pair<float, size_t>> groups(kGroups);
         for (size_t group = 0; group < kGroups; ++group) {
@@ -544,25 +555,45 @@ void dump_thinker_probe(const MingTinyAssets & assets, const std::vector<int32_t
     }
     writer.add("embedding", state, {1, static_cast<int64_t>(tokens), static_cast<int64_t>(hidden)});
 
-    const size_t limit = std::min<size_t>(layers, 4);  // layers 0-2 KDA, layer 3 first MLA
-    for (size_t layer = 0; layer < limit; ++layer) {
-        std::vector<float> after_attention;
+    // Seeded mode: start from a captured hidden state instead of the embedding, so a
+    // later layer can be judged independently of error inherited from earlier layers.
+    size_t first_layer = 0;
+    const size_t limit = std::min<size_t>(layers, 4);
+    if (const char * seed_path = std::getenv("MING3_TINY_SEED_STATE");
+        seed_path != nullptr && *seed_path != '\0') {
+        std::ifstream in(seed_path, std::ios::binary);
+        if (!in) throw std::runtime_error(std::string("cannot open seed state: ") + seed_path);
+        in.read(reinterpret_cast<char *>(state.data()), static_cast<std::streamsize>(state.size() * sizeof(float)));
+        const char * layer_env = std::getenv("MING3_TINY_SEED_LAYER");
+        first_layer = layer_env != nullptr ? static_cast<size_t>(std::atoi(layer_env)) : 3;
+        std::printf("  stage B seed    : %s -> starting at layer %zu\n", seed_path, first_layer);
+    }
+
+    for (size_t layer = first_layer; layer < limit; ++layer) {
+        std::vector<float> after_attention, attention_only;
         if (layer % 4 == 3) {
-            run_mla(assets, layer, state, tokens, after_attention);
+            run_mla(assets, layer, state, tokens, after_attention, attention_only);
         } else {
-            run_kda(assets, layer, state, tokens, after_attention);
+            run_kda(assets, layer, state, tokens, after_attention, attention_only);
         }
+        writer.add("attn_out_layer_" + std::to_string(layer), attention_only,
+            {1, static_cast<int64_t>(tokens), static_cast<int64_t>(hidden)});
         std::vector<float> after_block;
         if (layer < static_cast<size_t>(assets.config.first_k_dense_replace)) {
             run_dense_mlp(assets, layer, after_attention, tokens, after_block);
         } else {
             Routing routing;
-            run_moe(assets, layer, after_attention, tokens, after_block, routing);
+            std::vector<float> pre_router, router_scores;
+            run_moe(assets, layer, after_attention, tokens, after_block, routing, pre_router, router_scores);
             const std::string tag = "routing_layer_" + std::to_string(layer);
             writer.add_bytes(tag + "_ids", routing.ids.data(), routing.ids.size() * sizeof(int32_t),
                 {static_cast<int64_t>(tokens), static_cast<int64_t>(kTopK)}, "int32");
             writer.add(tag + "_weights", routing.weights,
                 {static_cast<int64_t>(tokens), static_cast<int64_t>(kTopK)});
+            writer.add("pre_router_layer_" + std::to_string(layer), pre_router,
+                {1, static_cast<int64_t>(tokens), static_cast<int64_t>(hidden)});
+            writer.add("router_scores_layer_" + std::to_string(layer), router_scores,
+                {static_cast<int64_t>(tokens), static_cast<int64_t>(assets.config.experts)});
         }
         state = std::move(after_block);
         writer.add("layer_" + std::to_string(layer), state,

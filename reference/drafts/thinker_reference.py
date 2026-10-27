@@ -116,7 +116,7 @@ def router(hidden: torch.Tensor, weight: torch.Tensor, expert_bias: torch.Tensor
         weights = gathered / (gathered.sum(dim=-1, keepdim=True) + 1e-20)
     else:
         weights = gathered
-    return top_idx, weights * scaling, logits
+    return top_idx, weights * scaling, logits, scores
 
 
 FLA_REF = Path(__file__).resolve().parents[2] / "reference" / "fla"
@@ -303,7 +303,7 @@ def moe_forward(hidden: torch.Tensor, store: "WeightStore", cfg: dict, layer: in
 
     prefix = f"model.model.layers.{layer}.mlp"
     x = hidden.reshape(-1, hidden.shape[-1])
-    top_idx, weights, logits = router(
+    top_idx, weights, logits, scores = router(
         x, store.get(prefix + ".gate.weight"), store.get(prefix + ".gate.expert_bias"),
         cfg["n_group"], cfg["topk_group"], cfg["num_experts_per_tok"], cfg["routed_scaling_factor"])
 
@@ -318,7 +318,7 @@ def moe_forward(hidden: torch.Tensor, store: "WeightStore", cfg: dict, layer: in
             y[mask] += contribution * weight[mask].unsqueeze(-1)
 
     y = y + mlp_forward(x, store, prefix + ".shared_experts")
-    return y.view_as(hidden), logits, top_idx, weights
+    return y.view_as(hidden), logits, top_idx, weights, scores
 
 
 def run_thinker(model: Path, text: str, prompt_ids: list[int], out_dir: Path) -> int:
@@ -335,26 +335,31 @@ def run_thinker(model: Path, text: str, prompt_ids: list[int], out_dir: Path) ->
     hidden = store.get("model.model.word_embeddings.weight")[ids]        # [1, T, 1536]
     captures = {"embedding": hidden.clone()}
     router_captures = {}
+    attention_captures = {}
 
     for layer in range(cfg["num_hidden_layers"]):
         prefix = f"model.model.layers.{layer}."
         residual = hidden
         normed = rms_norm(hidden, store.get(prefix + "input_layernorm.weight"), eps)
         if attention_kind(cfg, layer) == "mla":
-            hidden = residual + mla_layer(normed, store, cfg, layer)
+            attention_only = mla_layer(normed, store, cfg, layer)
         else:
-            hidden = residual + kda_layer(normed, store, cfg, layer)
+            attention_only = kda_layer(normed, store, cfg, layer)
+        attention_captures[layer] = attention_only.clone()
+        hidden = residual + attention_only
 
         residual = hidden
         normed = rms_norm(hidden, store.get(prefix + "post_attention_layernorm.weight"), eps)
         if layer < cfg["first_k_dense_replace"]:
             block = mlp_forward(normed, store, prefix + "mlp")
         else:
-            block, logits, top_idx, top_weights = moe_forward(normed, store, cfg, layer)
+            block, logits, top_idx, top_weights, scores = moe_forward(normed, store, cfg, layer)
             router_captures[layer] = {
                 "logits": logits.detach().numpy(),
                 "top_idx": top_idx.detach().numpy(),
                 "weights": top_weights.detach().numpy(),
+                "scores": scores.detach().numpy(),
+                "pre_router": normed.detach().numpy(),
             }
         hidden = residual + block
         captures[f"layer_{layer}"] = hidden.clone()
@@ -364,7 +369,11 @@ def run_thinker(model: Path, text: str, prompt_ids: list[int], out_dir: Path) ->
 
     out_dir.mkdir(parents=True, exist_ok=True)
     arrays = {name: tensor.detach().float().numpy() for name, tensor in captures.items()}
+    for layer, tensor in attention_captures.items():
+        arrays[f"attn_out_layer_{layer}"] = tensor.detach().float().numpy()
     for layer, info in router_captures.items():
+        arrays[f"pre_router_layer_{layer}"] = info["pre_router"].astype("float32")
+        arrays[f"router_scores_layer_{layer}"] = info["scores"].astype("float32")
         arrays[f"routing_layer_{layer}_ids"] = info["top_idx"].astype("int32")
         arrays[f"routing_layer_{layer}_weights"] = info["weights"].astype("float32")
     arrays["final_norm"] = final.detach().float().numpy()
