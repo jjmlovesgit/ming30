@@ -6,6 +6,7 @@
 #include "engine/models/ming3_tts_tiny/flow.h"
 #include "engine/models/ming3_tts_tiny/vae.h"
 #include "engine/models/ming3_tts_tiny/loop.h"
+#include "engine/models/ming3_tts_tiny/encoder.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -282,6 +283,18 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
 
         if (const char * res_env = std::getenv("MING3_TINY_GPU_RESIDENCY"); res_env != nullptr && *res_env != '\0') {
             run_gpu_residency_probe(*assets);
+        }
+
+        // Encoder probe: waveform file -> reference latents (math port, temporary env).
+        if (const char * wav = std::getenv("MING3_TINY_ENCODE_WAV"); wav != nullptr && *wav != '\0') {
+            std::ifstream in(wav, std::ios::binary | std::ios::ate);
+            if (!in) throw std::runtime_error(std::string("cannot open ") + wav);
+            const auto bytes = static_cast<size_t>(in.tellg());
+            in.seekg(0);
+            std::vector<float> waveform(bytes / sizeof(float));
+            in.read(reinterpret_cast<char *>(waveform.data()), static_cast<std::streamsize>(bytes));
+            const char * dir = std::getenv("MING3_TINY_ENCODE_DIR");
+            dump_encoder_probe(*assets, waveform, std::filesystem::path{dir != nullptr ? dir : "encoder-dump"});
         }
 
         // Podcast prompt assembly: reference latents supplied from file (test bridge).
