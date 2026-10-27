@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
-"""Write a Ming-3.0-tts-tiny GGUF from the published checkpoint (route B).
+"""Write a Ming-3.0-tts-tiny GGUF using the observed audio.cpp container contract.
 
-Route B because `audiocpp_gguf` validates `--family` against the registry, and the
-`ming3_tts_tiny` family does not exist in the runtime yet. This writer therefore
-*defines* the layout the C++ family will implement, deliberately mirroring
-`ming3_audio`:
+Layout (from docs/gguf-container-contract.md, read off a real Ming package):
 
-  * MoE backbone as `_audiocpp.{i}` banks; logical names, ranks and shapes travel in
-    `audiocpp.tensor_names` / `tensor_ranks` / `tensor_shapes` metadata, exactly the
-    convention `convert_ming3_audio_gguf.py` uses;
-  * talker / vae / speaker tensors under `talker/`, `vae/`, `speaker/` prefixes;
-  * sidecar files embedded as `audiocpp.file.<relative>` byte arrays plus an index.
+  general.architecture                 "audiocpp"
+  audiocpp.model_spec.family           "ming3_tts_tiny"
+  audiocpp.model_spec.json             family spec, embedded (self-describing)
+  audiocpp.tensor_names/ranks/shapes   logical name of EVERY tensor
+  physical tensors                     _audiocpp.{i}
+  audiocpp.embedded_files.{names,offsets,data}   config, tokenizer, chat template, ...
 
-Modes:
-    --dry-run   classify only, write nothing
-    --probe     metadata + talker/vae/speaker + layer-0 dense + layer-1 banks only
-    --write     full conversion
+`--type q8_0` quantises only the routed expert banks; every other tensor keeps
+source precision, including `lm_head` — a quantised output head ends turns early.
 
-Quantisation: `--type orig` writes bf16/f32 as stored. `--type q8_0` quantises the
-expert banks per row and keeps every other tensor at source precision, including
-`lm_head` (the MOSS-TTSD lesson: a quantised output head ends turns early).
+Modes: --dry-run (classify only), --probe (layer-0 + one layer's banks + all
+components), --write (full package).
+
+Scope: a probe package is a STRUCTURAL test. It proves layout, quantisation and
+embedded-file delivery. It says nothing about inference parity.
 """
 
 from __future__ import annotations
@@ -35,7 +33,6 @@ from pathlib import Path
 import numpy as np
 
 EXPERT_RE = re.compile(r"^model\.model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
-LAYER_RE = re.compile(r"^model\.model\.layers\.(\d+)\.")
 
 COMPONENT_PREFIXES = (
     ("model.model.", "thinker"),
@@ -54,11 +51,18 @@ SIDECARS = (
     "chat_template.jinja",
 )
 
-DTYPES = {
-    "BF16": (np.uint16, 30),
-    "F16": (np.float16, 1),
-    "F32": (np.float32, 0),
-}
+TYPE = {"F32": 0, "F16": 1, "Q8_0": 8, "BF16": 30}
+DTYPES = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32}
+
+
+def is_bank(logical: str) -> bool:
+    """Routed expert bank: model.layers.N.mlp.experts.{gate,up,down}_proj.weight.
+
+    The predicate shape matters: bank names end in `experts.gate_proj.weight`, so a
+    check for `experts.weight` matches nothing and silently skips quantisation.
+    """
+
+    return ".mlp.experts." in logical and logical.endswith(".weight")
 
 
 def classify(name: str) -> str:
@@ -75,17 +79,13 @@ def load_plan(source: Path) -> dict:
 
 
 def analyse(plan: dict) -> dict:
-    config = plan["config"]
-    llm = config.get("llm_config") or {}
+    llm = plan["config"].get("llm_config") or {}
     layers = int(llm.get("num_hidden_layers", 0))
     experts = int(llm.get("num_experts", 0))
-    top_k = int(llm.get("num_experts_per_tok") or 0)
-
     components: Counter[str] = Counter()
     unclassified: list[str] = []
     expert_layers: dict[int, Counter[str]] = defaultdict(Counter)
-    dense_tensors = 0
-    expert_tensor_count = 0
+    expert_tensors = 0
 
     for name in plan["weight_map"]:
         component = classify(name)
@@ -96,49 +96,37 @@ def analyse(plan: dict) -> dict:
         match = EXPERT_RE.match(name)
         if match:
             expert_layers[int(match.group(1))][match.group(3)] += 1
-            expert_tensor_count += 1
-        elif LAYER_RE.match(name):
-            dense_tensors += 1
+            expert_tensors += 1
 
-    banks = {}
-    for layer, counter in sorted(expert_layers.items()):
-        banks[layer] = {"experts": max(counter.values()), "projections": sorted(counter),
-                        "complete": all(counter[p] == experts for p in counter)}
-
+    banks = {
+        layer: {"experts": max(counter.values()), "projections": sorted(counter),
+                "complete": all(counter[p] == experts for p in counter)}
+        for layer, counter in sorted(expert_layers.items())
+    }
     return {
-        "layers": layers, "experts": experts, "top_k": top_k,
+        "layers": layers, "experts": experts, "top_k": int(llm.get("num_experts_per_tok") or 0),
         "components": dict(components), "unclassified": unclassified,
-        "expert_layers": sorted(expert_layers),
-        "expert_tensors": expert_tensor_count, "dense_layer_tensors": dense_tensors,
-        "banks": banks,
+        "expert_tensors": expert_tensors, "banks": banks,
     }
 
 
-# ---------------------------------------------------------------- source access
-
-def open_headers(source: Path, weight_map: dict):
-    """Read per-tensor shape/dtype from safetensors headers without loading data."""
-
+def open_headers(source: Path, weight_map: dict) -> dict:
     headers = {}
     for shard in dict.fromkeys(weight_map.values()):
         with (source / shard).open("rb") as stream:
             size = struct.unpack("<Q", stream.read(8))[0]
             header = json.loads(stream.read(size))
         header.pop("__metadata__", None)
-        for name, info in header.items():
-            headers[name] = info
+        headers.update(header)
     return headers
 
 
 class Tensors:
-    """Lazy per-shard safetensors access."""
-
     def __init__(self, source: Path, weight_map: dict):
         from safetensors import safe_open
 
-        self.source = source
-        self.weight_map = weight_map
-        self.handles = {}
+        self.source, self.weight_map = source, weight_map
+        self.handles: dict[str, object] = {}
         self._safe_open = safe_open
 
     def handle(self, name):
@@ -156,95 +144,85 @@ class Tensors:
         return np.ascontiguousarray(tensor.numpy())
 
 
-# ---------------------------------------------------------------- thinker plan
-
-def build_thinker_plan(plan: dict, headers: dict) -> list[tuple[str, list[int], str, object]]:
-    """(logical_name, shape, dtype, single_source_name | [sources]) in write order."""
-
+def build_plan(plan: dict, headers: dict, campplus_path: Path) -> list[dict]:
     weight_map = plan["weight_map"]
     llm = plan["config"]["llm_config"]
     layers = int(llm["num_hidden_layers"])
     experts = int(llm["num_experts"])
     first_moe = int(llm.get("first_k_dense_replace", 1))
 
-    plan_items = []
+    items: list[dict] = []
     for name in weight_map:
-        if classify(name) != "thinker":
+        if classify(name) != "thinker" or EXPERT_RE.match(name):
             continue
-        match = EXPERT_RE.match(name)
-        if match:
-            continue  # banks are appended below
         logical = name[len("model."):] if name.startswith("model.model.") else "lm_head.weight"
-        plan_items.append((logical, headers[name]["shape"], headers[name]["dtype"], name))
+        items.append({"logical": logical, "shape": list(headers[name]["shape"]),
+                      "dtype": headers[name]["dtype"], "kind": "single", "source": name})
 
     for layer in range(first_moe, layers):
         for projection in ("gate_proj", "up_proj", "down_proj"):
             sources = [f"model.model.layers.{layer}.mlp.experts.{i}.{projection}.weight"
                        for i in range(experts)]
             first = headers[sources[0]]
-            for name in sources:
-                if headers[name]["shape"] != first["shape"] or headers[name]["dtype"] != first["dtype"]:
-                    raise ValueError(f"Inconsistent expert bank at {name}")
-            plan_items.append((
-                f"model.layers.{layer}.mlp.experts.{projection}.weight",
-                [experts, *first["shape"]], first["dtype"], sources,
-            ))
-    return plan_items
+            items.append({"logical": f"model.layers.{layer}.mlp.experts.{projection}.weight",
+                          "shape": [experts, *first["shape"]], "dtype": first["dtype"],
+                          "kind": "bank", "source": sources})
+
+    for name in weight_map:
+        kind = classify(name)
+        if kind in ("talker", "vae"):
+            items.append({"logical": name, "shape": list(headers[name]["shape"]),
+                          "dtype": headers[name]["dtype"], "kind": "single", "source": name})
+
+    if campplus_path.exists():
+        from convert_ming3_tts_gguf import campplus_weights
+
+        for name, values in campplus_weights(campplus_path).items():
+            items.append({"logical": name, "shape": list(values.shape), "dtype": "F32",
+                          "kind": "speaker", "source": name, "values": values})
+    return items
 
 
-def gather_thinker(item, tensors):
-    _, _, dtype, source_names = item
-    if isinstance(source_names, list):
-        first = tensors.get(source_names[0], dtype)
-        values = np.empty((len(source_names), *first.shape), dtype=first.dtype)
-        for index, name in enumerate(source_names):
-            values[index] = tensors.get(name, dtype)
-        return values
-    return tensors.get(source_names, dtype)
+def gather(item: dict, tensors: Tensors) -> np.ndarray:
+    if item["kind"] == "speaker":
+        return np.ascontiguousarray(item["values"])
+    if item["kind"] == "bank":
+        first = tensors.get(item["source"][0], item["dtype"])
+        out = np.empty((len(item["source"]), *first.shape), dtype=first.dtype)
+        for index, name in enumerate(item["source"]):
+            out[index] = tensors.get(name, item["dtype"])
+        return out
+    return tensors.get(item["source"], item["dtype"])
 
 
-# ---------------------------------------------------------------- gguf writing
-
-def quantize_rows(values: np.ndarray, quant_type) -> bytes:
-    """Q8_0 quantisation of the last axis, flattened to 2-D rows."""
-
+def q8_blocks(values: np.ndarray) -> np.ndarray:
     from gguf import quants
 
-    rows = int(np.prod(values.shape[:-1])) if values.ndim > 1 else 1
-    width = values.shape[-1]
+    width = int(values.shape[-1])
     if width % 32:
-        raise ValueError(f"last dimension {width} is not a multiple of 32; cannot use Q8_0")
-    flat = values.reshape(rows, width).astype(np.float32)
-    blocks = quants.quantize(flat, quant_type)
-    return np.ascontiguousarray(blocks).tobytes()
-
-
-def add_tensor(writer, gguf, name, values, logical_shape, dtype, quant_type=None):
-    numpy_type, raw_type_id = DTYPES[dtype]
-    if quant_type is not None:
-        data = quantize_rows(values, quant_type)
-        raw_dtype = quant_type
-        nbytes = len(data)
+        raise ValueError(f"last dimension {width} is not a multiple of 32 for Q8_0")
+    rows = int(np.prod(values.shape[:-1])) if values.ndim > 1 else 1
+    flat = values.reshape(rows, width)
+    if flat.dtype == np.uint16:
+        # gather() hands back bf16 bit patterns as uint16; quantising those bits as
+        # integers produces garbage, so widen bf16 -> f32 first (low half zeroed).
+        flat = (flat.astype(np.uint32) << 16).view(np.float32)
     else:
-        data = np.ascontiguousarray(values.astype(numpy_type, copy=False)).tobytes()
-        raw_dtype = gguf.GGMLQuantizationType(raw_type_id)
-        nbytes = len(data)
-    writer.add_tensor_info(name, logical_shape, np.dtype(numpy_type), nbytes, raw_dtype=raw_dtype)
-    # GGUFWriter.write_tensor_data needs a numpy array (it asserts on .nbytes)
-    return np.frombuffer(data, dtype=np.uint8)
+        flat = flat.astype(np.float32)
+    return np.ascontiguousarray(quants.quantize(flat, quants.GGMLQuantizationType.Q8_0))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--spec", type=Path, help="family spec JSON to embed")
     parser.add_argument("--type", choices=("orig", "q8_0"), default="orig")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--probe-layer", type=int, default=1)
+    parser.add_argument("--max-sidecar-bytes", type=int, default=64_000_000)
     parser.add_argument("--log", action="store_true")
-    parser.add_argument("--sidecar-limit", type=int, default=1_000_000,
-                        help="embed sidecars up to this many bytes; larger ones are listed as skipped")
     args = parser.parse_args()
 
     source = args.source.resolve()
@@ -253,18 +231,17 @@ def main() -> int:
 
     print(f"checkpoint      : {source}")
     print(f"model_type      : {plan['config'].get('model_type')}  arch={plan['config'].get('architectures')}")
-    print(f"layers / experts: {report['layers']} / {report['experts']}  (top-{report['top_k']})")
-    print(f"tensors         : {sum(report['components'].values())}")
+    print(f"layers / experts: {report['layers']} / {report['experts']} (top-{report['top_k']})")
     for component, count in sorted(report["components"].items()):
         print(f"  {component:<13} {count:>5}")
     if report["unclassified"]:
-        print("\nUNCLASSIFIED:", report["unclassified"][:10])
+        print("UNCLASSIFIED:", report["unclassified"][:10])
         return 2
     incomplete = [layer for layer, info in report["banks"].items() if not info["complete"]]
     if incomplete:
-        print(f"INCOMPLETE expert banks on layers {incomplete}")
+        print(f"INCOMPLETE banks on layers {incomplete}")
         return 3
-    print(f"expert tensors  : {report['expert_tensors']} in {len(report['banks'])} MoE layers, all banks complete")
+    print(f"expert tensors  : {report['expert_tensors']} in {len(report['banks'])} MoE layers, all complete")
 
     if args.dry_run:
         print("\ndry run: nothing written")
@@ -273,129 +250,108 @@ def main() -> int:
         parser.error("--output is required unless --dry-run")
 
     import gguf
-    from gguf import quants
-    from convert_ming3_tts_gguf import campplus_weights  # shared CAMPPlus repacking
 
     headers = open_headers(source, plan["weight_map"])
     tensors = Tensors(source, plan["weight_map"])
-    thinker = build_thinker_plan(plan, headers)
-    quant_type = quants.GGMLQuantizationType.Q8_0 if args.type == "q8_0" else None
+    items = build_plan(plan, headers, source / "campplus.onnx")
 
-    # probe narrows the write set but keeps the full metadata
-    keep_banks = {args.probe_layer} if args.probe else None
-    selected = []
-    for item in thinker:
-        logical = item[0]
-        if keep_banks is not None:
+    if args.probe:
+        kept = []
+        for item in items:
+            logical = item["logical"]
             match = re.match(r"^model\.layers\.(\d+)\.", logical)
-            is_bank = ".mlp.experts." in logical and logical.endswith(".weight")
-            if is_bank:
-                if match is None or int(match[1]) not in keep_banks:
-                    continue
-            elif match is not None and int(match[1]) != 0:
-                continue
-        selected.append(item)
+            if is_bank(logical):
+                if match and int(match[1]) == args.probe_layer:
+                    kept.append(item)
+            elif match is not None:
+                if int(match[1]) == 0:
+                    kept.append(item)
+            else:
+                kept.append(item)
+        items = kept
 
-    writer = gguf.GGUFWriter(str(args.output), "ming3_tts_tiny")
-    writer.add_string("audiocpp.family", "ming3_tts_tiny")
-    writer.add_string("audiocpp.probe", "layer-%d" % args.probe_layer if args.probe else "full")
-    writer.add_string("audiocpp.expert_dtype", "q8_0" if quant_type else "source")
+    quant_banks = args.type == "q8_0"
+    writer = gguf.GGUFWriter(str(args.output), "audiocpp")
+    writer.add_string("general.architecture", "audiocpp")
+    writer.add_string("general.name", f"ming3-tts-tiny-{'probe' if args.probe else 'full'}")
+    writer.add_string("audiocpp.tensor_name_format", "native")
+    writer.add_string("audiocpp.source_format", ".gguf")
+    writer.add_string("audiocpp.weight_type", "q8_0" if quant_banks else "orig")
+    writer.add_uint32("audiocpp.model_spec.version", 1)
+    writer.add_string("audiocpp.model_spec.family", "ming3_tts_tiny")
+    if args.spec and args.spec.exists():
+        writer.add_string("audiocpp.model_spec.json", args.spec.read_text(encoding="utf-8"))
 
-    thinker_out = selected if args.probe else thinker
-    writer.add_array("audiocpp.tensor_names", [name for name, *_ in thinker_out])
-    writer.add_key_value("audiocpp.tensor_ranks", [len(shape) for _, shape, _, _ in thinker_out],
+    writer.add_array("audiocpp.tensor_names", [item["logical"] for item in items])
+    writer.add_key_value("audiocpp.tensor_ranks", [len(item["shape"]) for item in items],
                          gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.INT32)
-    writer.add_key_value("audiocpp.tensor_shapes", [d for _, shape, _, _ in thinker_out for d in shape],
+    writer.add_key_value("audiocpp.tensor_shapes", [d for item in items for d in item["shape"]],
                          gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.INT64)
+    writer.add_array("audiocpp.tensor_sources.names", [""])
+    writer.add_array("audiocpp.tensor_sources.paths", [str(args.output.resolve())])
 
-    # sidecars
-    embedded, skipped = [], []
+    file_names, file_blobs, total = [], [], 0
     for name in SIDECARS:
         path = source / name
         if not path.exists():
-            skipped.append(f"{name}:absent")
+            print(f"  sidecar absent, not embedded: {name}")
             continue
-        data = path.read_bytes()
-        if len(data) > args.sidecar_limit:
-            skipped.append(f"{name}:>{args.sidecar_limit}B")
-            continue
-        writer.add_array(f"audiocpp.file.{name}", data)
-        embedded.append(name)
-    writer.add_array("audiocpp.files", embedded)
-    writer.add_array("audiocpp.files_skipped", skipped)
-    print(f"  sidecars embedded: {embedded}")
-    if skipped:
-        print(f"  sidecars skipped : {skipped}")
+        blob = path.read_bytes()
+        if len(blob) > args.max_sidecar_bytes:
+            raise SystemExit(f"sidecar {name} is {len(blob)} B, above --max-sidecar-bytes")
+        file_names.append(name)
+        file_blobs.append(blob)
+        total += len(blob)
+    offsets, running = [], 0
+    for blob in file_blobs:
+        offsets.append(running)
+        running += len(blob)
+    offsets.append(running)
+    writer.add_array("audiocpp.embedded_files.names", file_names)
+    writer.add_key_value("audiocpp.embedded_files.offsets", offsets,
+                         gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.INT64)
+    writer.add_array("audiocpp.embedded_files.data", b"".join(file_blobs))
+    print(f"  embedded files  : {len(file_names)} totaling {total/1e6:.1f} MB "
+          f"(tokenizer.json {'included' if 'tokenizer.json' in file_names else 'MISSING'})")
 
-    # component tensors keep real names with a prefix
-    components = []
-    for name in plan["weight_map"]:
-        kind = classify(name)
-        if kind == "thinker":
-            continue
-        prefix = "talker" if kind == "talker" else "vae"
-        components.append((f"{prefix}/{name}", name, headers[name]["dtype"]))
-
-    speaker = {}
-    campplus = source / "campplus.onnx"
-    if campplus.exists():
-        speaker = campplus_weights(campplus)
-        for name in speaker:
-            components.append((f"speaker/{name}", None, "F32"))
-
-    # tensor infos: thinker as _audiocpp.{i}, components by real name
-    payload = []
-    thinker_quant = {}
-    for index, item in enumerate(thinker_out):
-        logical, shape, dtype, _ = item
-        use_quant = quant_type if (quant_type is not None and logical.endswith("experts.weight")) else None
-        thinker_quant[index] = use_quant
-        values = gather_thinker(item, tensors)
-        data = add_tensor(writer, gguf, f"_audiocpp.{index}", values, shape, dtype, use_quant)
-        payload.append((f"_audiocpp.{index}", data, shape, dtype, use_quant))
-
-    for physical, original, dtype in components:
-        if original is not None:
-            shape = list(headers[original]["shape"])
+    payloads = []
+    for index, item in enumerate(items):
+        dtype = item["dtype"]
+        values = gather(item, tensors)
+        if quant_banks and is_bank(item["logical"]):
+            blocks = q8_blocks(values)
+            # gguf-py wants the *byte* shape for a quantised tensor: the last dim is
+            # bytes-per-row (values/32*34), which it converts back to logical dims.
+            byte_shape = list(item["shape"])
+            byte_shape[-1] = byte_shape[-1] // 32 * 34
+            writer.add_tensor_info(f"_audiocpp.{index}", byte_shape, np.dtype(np.uint8),
+                                   blocks.nbytes, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+            payloads.append(blocks)
         else:
-            shape = list(speaker[physical.split("speaker/", 1)[1]].shape)
-        numpy_type, raw = DTYPES[dtype]
-        nbytes = int(np.prod(shape)) * np.dtype(numpy_type).itemsize
-        writer.add_tensor_info(physical, shape, np.dtype(numpy_type), nbytes,
-                               raw_dtype=gguf.GGMLQuantizationType(raw))
+            numpy_type = DTYPES[dtype]
+            raw = np.ascontiguousarray(values.astype(numpy_type, copy=False))
+            writer.add_tensor_info(f"_audiocpp.{index}", item["shape"], np.dtype(numpy_type),
+                                   raw.nbytes, raw_dtype=gguf.GGMLQuantizationType(TYPE[dtype]))
+            payloads.append(raw)
+        if args.log and index % 500 == 0:
+            print(f"  planned {index + 1}/{len(items)}", flush=True)
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_ti_data_to_file()
 
-    written = 0
-    for name, data, shape, dtype, _ in payload:
-        if data is None:
-            numpy_type, _ = DTYPES[dtype]
-            zeros = np.zeros(int(np.prod(shape)), dtype=numpy_type)
-            writer.write_tensor_data(zeros)
-        else:
-            writer.write_tensor_data(data)
-        written += 1
-        if args.log and written % 200 == 0:
-            print(f"  thinker {written}/{len(payload)}", flush=True)
-
-    comp_data = []
-    for physical, original, dtype in components:
-        if original is None:
-            values = speaker[physical.split("speaker/", 1)[1]]
-            comp_data.append(values.astype(np.float32))
-        else:
-            comp_data.append(tensors.get(original, dtype))
-    for values in comp_data:
-        writer.write_tensor_data(np.ascontiguousarray(values))
+    banks_written = 0
+    for index, payload in enumerate(payloads):
+        writer.write_tensor_data(payload)
+        banks_written += int(is_bank(items[index]["logical"]))
+        if args.log and index % 500 == 0:
+            print(f"  wrote {index + 1}/{len(payloads)}", flush=True)
     writer.close()
 
-    size = args.output.stat().st_size
-    print(f"\nwrote {args.output}  {size/1e6:.1f} MB")
-    print(f"  thinker tensors : {len(payload)} (data for {len(selected)})")
-    print(f"  component tensor: {len(components)}")
-    print(f"  sidecars        : {embedded}")
+    print(f"\nwrote {args.output}  {args.output.stat().st_size/1e6:.1f} MB")
+    print(f"  tensors          : {len(items)} ({banks_written} expert banks, "
+          f"{'q8_0' if quant_banks else 'source precision'})")
+    print("  scope            : STRUCTURAL test only; no inference parity is implied")
     return 0
 
 
