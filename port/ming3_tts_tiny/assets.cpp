@@ -285,6 +285,42 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
             run_gpu_residency_probe(*assets);
         }
 
+        // WAV-backed podcast prompt: reference clips -> concatenated waveform -> encoder ->
+        // prompt matrix. Clips are concatenated in the order given, matching the checkpoint.
+        if (const char * wavs = std::getenv("MING3_TINY_PODCAST_WAVS"); wavs != nullptr && *wavs != '\0') {
+            std::vector<std::string> paths;
+            std::string current;
+            for (const char * cursor = wavs; *cursor != '\0'; ++cursor) {
+                if (*cursor == ';') {
+                    if (!current.empty()) paths.push_back(current);
+                    current.clear();
+                } else {
+                    current.push_back(*cursor);
+                }
+            }
+            if (!current.empty()) paths.push_back(current);
+
+            std::vector<float> waveform;
+            for (const auto & path : paths) {
+                const auto samples = load_wav_mono(path);
+                std::printf("  wav reference   : %s -> %zu samples (%.2f s)\n", path.c_str(), samples.size(),
+                    static_cast<double>(samples.size()) / 44100.0);
+                waveform.insert(waveform.end(), samples.begin(), samples.end());
+            }
+            std::vector<float> latents;
+            size_t frames = 0;
+            encode_reference(*assets, waveform, latents, frames);
+            std::printf("  wav encode      : %zu samples -> %zu frames -> %zu latents\n", waveform.size(), frames,
+                latents.size() / 64);
+
+            const char * script_env = std::getenv("MING3_TINY_PODCAST_SCRIPT");
+            const char * reference_env = std::getenv("MING3_TINY_PODCAST_REFERENCE");
+            const char * out_env = std::getenv("MING3_TINY_PODCAST_ASSEMBLE_DIR");
+            dump_podcast_prompt_probe(*assets, script_env != nullptr ? script_env : "",
+                reference_env != nullptr ? reference_env : "", latents, latents.size() / 64,
+                std::filesystem::path{out_env != nullptr ? out_env : "podcast-wav-embeds"});
+        }
+
         // Encoder probe: waveform file -> reference latents (math port, temporary env).
         if (const char * wav = std::getenv("MING3_TINY_ENCODE_WAV"); wav != nullptr && *wav != '\0') {
             std::ifstream in(wav, std::ios::binary | std::ios::ate);

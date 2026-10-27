@@ -17,6 +17,10 @@ void encode_reference(const MingTinyAssets & assets, const std::vector<float> & 
     std::vector<float> * fc2_out = nullptr, std::vector<float> * encoder_out = nullptr,
     std::vector<float> * aggregated_out = nullptr);
 
+// Load a RIFF/WAVE file as mono float samples. Supports 16-bit PCM and 32-bit float,
+// averaging channels. Requires 44100 Hz (no resampling here).
+std::vector<float> load_wav_mono(const std::filesystem::path & path);
+
 // Probe: encode a raw f32 waveform file and write latents plus selected intermediates.
 void dump_encoder_probe(const MingTinyAssets & assets, const std::vector<float> & waveform,
     const std::filesystem::path & directory);

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,7 @@ constexpr size_t kPatch = 4;
 constexpr size_t kLatent = 64;
 constexpr float kEps = 1e-6f;
 constexpr float kTheta = 1e6f;
+constexpr size_t kWindow = 64;   // Qwen2 sliding window: use_sliding_window=true, max_window_layers=0
 
 float bf16_to_float(uint16_t bits) {
     const uint32_t wide = static_cast<uint32_t>(bits) << 16;
@@ -92,7 +94,7 @@ private:
 
 // One Qwen2-style causal stack (encoder or aggregator), rope positions from 0 per call.
 void qwen_forward(Weights & weights, const std::string & prefix, size_t layers, size_t tokens,
-    std::vector<float> & hidden) {
+    std::vector<float> & hidden, size_t window = 0) {
     // Qwen2 rotates halves: cos/sin are [half, half] and pairs are (i, i + half).
     std::vector<float> cos_table(tokens * kHeadDim), sin_table(tokens * kHeadDim);
     const size_t half = kHeadDim / 2;
@@ -152,8 +154,9 @@ void qwen_forward(Weights & weights, const std::string & prefix, size_t layers, 
         for (size_t head = 0; head < kHeads; ++head) {
             const size_t kv_head = head / (kHeads / kKvHeads);
             for (size_t token = 0; token < tokens; ++token) {
+                const size_t first_key = (window != 0 && token + 1 > window) ? token + 1 - window : 0;
                 float best = -1e30f;
-                for (size_t key = 0; key <= token; ++key) {
+                for (size_t key = first_key; key <= token; ++key) {
                     float sum = 0.0f;
                     for (size_t dim = 0; dim < kHeadDim; ++dim) {
                         sum += q[token * kHeads * kHeadDim + head * kHeadDim + dim] *
@@ -163,13 +166,13 @@ void qwen_forward(Weights & weights, const std::string & prefix, size_t layers, 
                     best = std::max(best, scores[key]);
                 }
                 float total = 0.0f;
-                for (size_t key = 0; key <= token; ++key) {
+                for (size_t key = first_key; key <= token; ++key) {
                     scores[key] = std::exp(scores[key] - best);
                     total += scores[key];
                 }
                 for (size_t dim = 0; dim < kHeadDim; ++dim) {
                     float sum = 0.0f;
-                    for (size_t key = 0; key <= token; ++key) {
+                    for (size_t key = first_key; key <= token; ++key) {
                         sum += scores[key] / total * v[key * kKvHeads * kHeadDim + kv_head * kHeadDim + dim];
                     }
                     attn[token * kHeads * kHeadDim + head * kHeadDim + dim] = sum;
@@ -198,6 +201,89 @@ void qwen_forward(Weights & weights, const std::string & prefix, size_t layers, 
 
 }  // namespace
 
+std::vector<float> load_wav_mono(const std::filesystem::path & path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open WAV: " + path.string());
+    const auto read_u32 = [&](const char * expected) {
+        char tag[4] = {0, 0, 0, 0};
+        in.read(tag, 4);
+        if (std::memcmp(tag, expected, 4) != 0) {
+            throw std::runtime_error("WAV: expected '" + std::string(expected, 4) + "' in " + path.string());
+        }
+    };
+    const auto read_le32 = [&]() {
+        unsigned char bytes[4];
+        in.read(reinterpret_cast<char *>(bytes), 4);
+        return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
+               (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
+    };
+    const auto read_le16 = [&]() {
+        unsigned char bytes[2];
+        in.read(reinterpret_cast<char *>(bytes), 2);
+        return static_cast<uint16_t>(bytes[0] | (bytes[1] << 8));
+    };
+
+    read_u32("RIFF");
+    (void) read_le32();                     // riff size
+    read_u32("WAVE");
+
+    uint16_t format = 0, channels = 0, bits = 0;
+    uint32_t rate = 0;
+    std::vector<char> data;
+    while (in) {
+        char tag[4];
+        in.read(tag, 4);
+        if (!in) break;
+        const uint32_t size = read_le32();
+        if (std::memcmp(tag, "fmt ", 4) == 0) {
+            format = read_le16();
+            channels = read_le16();
+            rate = read_le32();
+            (void) read_le32();                 // byte rate
+            (void) read_le16();                 // block align
+            bits = read_le16();
+            for (uint32_t skip = 16; skip < size; ++skip) in.get();
+        } else if (std::memcmp(tag, "data", 4) == 0) {
+            data.resize(size);
+            in.read(data.data(), static_cast<std::streamsize>(size));
+        } else {
+            for (uint32_t skip = 0; skip < size; ++skip) in.get();
+        }
+    }
+
+    if (rate != 44100) {
+        throw std::runtime_error("WAV must be 44100 Hz; got " + std::to_string(rate) + " (" + path.string() + ")");
+    }
+    if (channels == 0) throw std::runtime_error("WAV has no channels: " + path.string());
+
+    std::vector<float> samples;
+    if (format == 1 && bits == 16) {
+        const auto * raw = reinterpret_cast<const int16_t *>(data.data());
+        const size_t frames = data.size() / (sizeof(int16_t) * channels);
+        samples.resize(frames);
+        for (size_t frame = 0; frame < frames; ++frame) {
+            float sum = 0.0f;
+            for (size_t channel = 0; channel < channels; ++channel) {
+                sum += static_cast<float>(raw[frame * channels + channel]) / 32768.0f;
+            }
+            samples[frame] = sum / static_cast<float>(channels);
+        }
+    } else if (format == 3 && bits == 32) {
+        const auto * raw = reinterpret_cast<const float *>(data.data());
+        const size_t frames = data.size() / (sizeof(float) * channels);
+        samples.resize(frames);
+        for (size_t frame = 0; frame < frames; ++frame) {
+            float sum = 0.0f;
+            for (size_t channel = 0; channel < channels; ++channel) sum += raw[frame * channels + channel];
+            samples[frame] = sum / static_cast<float>(channels);
+        }
+    } else {
+        throw std::runtime_error("WAV: unsupported format " + std::to_string(format) + " / " +
+                                 std::to_string(bits) + " bits (" + path.string() + ")");
+    }
+    return samples;
+}
+
 void encode_reference(const MingTinyAssets & assets, const std::vector<float> & waveform,
     std::vector<float> & latents, size_t & frames,
     std::vector<float> * fc2_out, std::vector<float> * encoder_out, std::vector<float> * aggregated_out) {
@@ -222,7 +308,7 @@ void encode_reference(const MingTinyAssets & assets, const std::vector<float> & 
     }
 
     if (fc2_out != nullptr) *fc2_out = x;
-    qwen_forward(weights, "audio.encoder.encoder.", kEncoderLayers, frames, x);
+    qwen_forward(weights, "audio.encoder.encoder.", kEncoderLayers, frames, x, kWindow);
     if (encoder_out != nullptr) *encoder_out = x;
 
     // 4-frame aggregator: pad to a multiple of 4, prepend the CLS row per group, keep the CLS.
@@ -246,7 +332,8 @@ void encode_reference(const MingTinyAssets & assets, const std::vector<float> & 
 
     // The reference runs the aggregator ONCE over the packed sequence, so a group's CLS also
     // attends to earlier groups; only the CLS rows are kept.
-    qwen_forward(weights, "audio.encoder.aggregator.", kAggregatorLayers, groups * (kPatch + 1), packed);
+    qwen_forward(weights, "audio.encoder.aggregator.", kAggregatorLayers, groups * (kPatch + 1), packed,
+        kWindow);
     std::vector<float> aggregated(groups * kHidden);
     if (aggregated_out != nullptr) *aggregated_out = aggregated;   // sized, filled below
     for (size_t group = 0; group < groups; ++group) {
