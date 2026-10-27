@@ -20,6 +20,10 @@ struct FlowRequest {
     int steps = 10;
 };
 
+// One full Euler solve from an explicit noise vector.
+std::vector<float> flow_sample_from_noise(const MingTinyAssets & assets, const std::vector<float> & cond,
+    const std::vector<float> & noise, const std::vector<float> & history, float cfg, int steps);
+
 void dump_flow_probe(const MingTinyAssets & assets, const FlowRequest & request,
     const std::filesystem::path & directory);
 

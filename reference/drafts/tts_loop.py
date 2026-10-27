@@ -155,6 +155,9 @@ def main() -> int:
                 "step": step, "tokens": int(history_embeds.shape[1]),
                 "stop_logits": stop_logits.reshape(-1).tolist(), "stop_prob": stop_prob,
                 "latent": latent.reshape(-1).tolist(),
+                "noise": noise.reshape(-1).tolist(),
+                "feedback": feedback.reshape(-1).tolist(),
+                "final_last": last.reshape(-1).tolist(),
                 "feedback_norm": float(feedback.norm()),
                 "hidden_norm": float(last.norm()),
                 "noise_norm": float(noise.norm()),
@@ -165,7 +168,11 @@ def main() -> int:
 
     args.out.mkdir(parents=True, exist_ok=True)
     stacked = torch.cat(latents, dim=1)                       # [1, N, 64]
-    np.savez_compressed(args.out / "loop.npz", latents=stacked.numpy())
+    noises = np.stack([np.asarray(r["noise"], dtype=np.float32) for r in records])
+    feedback = np.stack([np.asarray(r["feedback"], dtype=np.float32) for r in records])
+    finals = np.stack([np.asarray(r["final_last"], dtype=np.float32) for r in records])
+    np.savez_compressed(args.out / "loop.npz",
+                        latents=stacked.numpy(), noises=noises, feedback=feedback, finals=finals)
     (args.out / "records.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
     print(f"latents: {tuple(stacked.shape)} ({stacked.shape[1] * 0.08:.2f} s of audio)")
     print(f"written: {args.out / 'loop.npz'}")

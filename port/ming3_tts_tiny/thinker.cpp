@@ -584,6 +584,31 @@ private:
 
 }  // namespace
 
+void thinker_forward_embeds(const MingTinyAssets & assets, const std::vector<float> & embeds, size_t tokens,
+    std::vector<float> & final_norm) {
+    std::vector<float> state = embeds;
+    for (size_t layer = 0; layer < static_cast<size_t>(assets.config.layers); ++layer) {
+        std::vector<float> after_attention, attention_only;
+        if (layer % 4 == 3) {
+            run_mla(assets, layer, state, tokens, after_attention, attention_only);
+        } else {
+            run_kda(assets, layer, state, tokens, after_attention, attention_only, nullptr);
+        }
+        std::vector<float> after_block;
+        if (layer < static_cast<size_t>(assets.config.first_k_dense_replace)) {
+            run_dense_mlp(assets, layer, after_attention, tokens, after_block);
+        } else {
+            Routing routing;
+            std::vector<float> pre_router, router_scores;
+            run_moe(assets, layer, after_attention, tokens, after_block, routing, pre_router, router_scores);
+        }
+        state = std::move(after_block);
+    }
+    const auto norm_weight = load_float(*assets.weights, "model.norm.weight",
+        {static_cast<int64_t>(assets.config.hidden_size)});
+    rms_norm(state.data(), norm_weight.data(), tokens, static_cast<size_t>(assets.config.hidden_size), final_norm);
+}
+
 void dump_thinker_probe(const MingTinyAssets & assets, const std::vector<int32_t> & prompt_ids,
     const std::filesystem::path & directory) {
     const size_t tokens = prompt_ids.size();

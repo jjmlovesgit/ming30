@@ -5,6 +5,7 @@
 #include "engine/models/ming3_tts_tiny/thinker.h"
 #include "engine/models/ming3_tts_tiny/flow.h"
 #include "engine/models/ming3_tts_tiny/vae.h"
+#include "engine/models/ming3_tts_tiny/loop.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -156,6 +157,24 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
             const size_t frames = latent.size() / 64;
             const char * vae_dir = std::getenv("MING3_TINY_VAE_DUMP_DIR");
             dump_vae_probe(*assets, latent, frames, std::filesystem::path{vae_dir != nullptr ? vae_dir : "vae-dump"});
+        }
+
+        // Stage E: the generation loop, replaying a Python noise stream.
+        if (const char * noise_path = std::getenv("MING3_TINY_LOOP_NOISE"); noise_path != nullptr && *noise_path != '\0') {
+            std::ifstream in(noise_path, std::ios::binary | std::ios::ate);
+            if (!in) throw std::runtime_error(std::string("cannot open ") + noise_path);
+            const auto bytes = static_cast<size_t>(in.tellg());
+            in.seekg(0);
+            if (bytes % (64 * sizeof(float)) != 0) throw std::runtime_error("loop noise file is not a whole number of 64-float patches");
+            std::vector<float> noises(bytes / sizeof(float));
+            in.read(reinterpret_cast<char *>(noises.data()), static_cast<std::streamsize>(bytes));
+            float cfg = 2.0f;
+            if (const char * cfg_env = std::getenv("MING3_TINY_LOOP_CFG"); cfg_env != nullptr) cfg = static_cast<float>(std::atof(cfg_env));
+            int flow_steps = 10;
+            if (const char * steps_env = std::getenv("MING3_TINY_LOOP_FLOW_STEPS"); steps_env != nullptr) flow_steps = std::atoi(steps_env);
+            const char * loop_dir = std::getenv("MING3_TINY_LOOP_DUMP_DIR");
+            dump_loop_probe(*assets, prompt.ids, noises, noises.size() / 64, cfg, flow_steps,
+                std::filesystem::path{loop_dir != nullptr ? loop_dir : "loop-dump"});
         }
     } catch (const std::exception & error) {
         std::printf("  prompt stage A  : FAILED: %s\n", error.what());

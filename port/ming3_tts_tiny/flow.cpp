@@ -240,6 +240,32 @@ struct Capture {
 
 }  // namespace
 
+std::vector<float> flow_sample_from_noise(const MingTinyAssets & assets, const std::vector<float> & cond,
+    const std::vector<float> & noise, const std::vector<float> & history, float cfg, int steps) {
+    FlowModel model(*assets.weights);
+    std::vector<float> grid = epss_timesteps(steps);
+    for (auto & value : grid) {
+        value = value - (std::cos(3.14159265358979323846f / 2.0f * value) - 1.0f + value);
+    }
+    std::vector<float> zero_cond(kCond, 0.0f);
+    std::vector<float> y = noise;
+    std::vector<float> conditioned(kLatent), nulled(kLatent), guided(kLatent);
+    for (size_t step = 0; step + 1 < grid.size(); ++step) {
+        dit_forward(model, cond, grid[step], history, y, conditioned, nullptr);
+        if (cfg != 1.0f) {
+            dit_forward(model, zero_cond, grid[step], history, y, nulled, nullptr);
+        } else {
+            nulled = conditioned;
+        }
+        for (size_t index = 0; index < kLatent; ++index) {
+            guided[index] = conditioned[index] + (conditioned[index] - nulled[index]) * cfg;
+        }
+        const float dt = grid[step + 1] - grid[step];
+        for (size_t index = 0; index < kLatent; ++index) y[index] += dt * guided[index];
+    }
+    return y;
+}
+
 void dump_flow_probe(const MingTinyAssets & assets, const FlowRequest & request,
     const std::filesystem::path & directory) {
     FlowModel model(*assets.weights);
