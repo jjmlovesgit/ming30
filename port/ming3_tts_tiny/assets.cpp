@@ -115,6 +115,29 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
         }
         std::printf("\n");
 
+        // Podcast prompt (reference transcript + trailing reference-latent placeholders).
+        if (const char * podcast = std::getenv("MING3_TINY_PODCAST_SCRIPT"); podcast != nullptr && *podcast != '\0') {
+            const char * reference_env = std::getenv("MING3_TINY_PODCAST_REFERENCE");
+            const std::string reference = reference_env != nullptr ? reference_env : "";
+            size_t latent_tokens = 100;
+            if (const char * latent_env = std::getenv("MING3_TINY_PODCAST_LATENTS"); latent_env != nullptr) {
+                latent_tokens = static_cast<size_t>(std::atoi(latent_env));
+            }
+            const auto segments = prompts.build_podcast_segments(podcast, reference, latent_tokens);
+            std::printf("  podcast prompt  : script=%zu chars reference=%zu chars latents=%zu\n",
+                std::strlen(podcast), reference.size(), latent_tokens);
+            std::vector<int32_t> ids;
+            for (const auto & [name, segment] : segments) {
+                std::printf("    %-16s ids=%zu\n", name.c_str(), segment.size());
+                ids.insert(ids.end(), segment.begin(), segment.end());
+            }
+            std::printf("    total=%zu\n    ids=", ids.size());
+            for (size_t index = 0; index < ids.size() && index < 200; ++index) {
+                std::printf("%s%d", index ? "," : "", ids[index]);
+            }
+            std::printf("\n");
+        }
+
         if (const char * dump_dir = std::getenv("MING3_TINY_DUMP_DIR"); dump_dir != nullptr && *dump_dir != '\0') {
             dump_thinker_probe(*assets, prompt.ids, std::filesystem::path{dump_dir});
             std::printf("  stage B dump    : %s (embedding + layer_0)\n", dump_dir);

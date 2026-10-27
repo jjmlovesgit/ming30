@@ -44,6 +44,21 @@ std::vector<std::pair<std::string, std::vector<int32_t>>> MingTinyPromptBuilder:
     return segments;
 }
 
+std::vector<std::pair<std::string, std::vector<int32_t>>> MingTinyPromptBuilder::build_podcast_segments(
+    const std::string & script, const std::string & reference_text, size_t latent_tokens) const {
+    std::vector<std::pair<std::string, std::vector<int32_t>>> segments;
+    segments.emplace_back("user_prefix", tokenizer_.encode(kUserPrefix, true));
+    segments.emplace_back("speaker_block",
+        std::vector<int32_t>{tokens_.speaker_start, tokens_.audio_patch, tokens_.speaker_end});
+    segments.emplace_back("text_prefix", tokenizer_.encode(kTextPrefix, true));
+    segments.emplace_back("reference_text", tokenizer_.encode(reference_text, true));
+    segments.emplace_back("target_text", tokenizer_.encode(script, true));
+    segments.emplace_back("assistant_prefix", tokenizer_.encode(kAssistantPrefix, true));
+    segments.emplace_back("audio_start", std::vector<int32_t>{tokens_.audio_start});
+    segments.emplace_back("prompt_latents", std::vector<int32_t>(latent_tokens, tokens_.audio_patch));
+    return segments;
+}
+
 MingTinyPromptIds MingTinyPromptBuilder::build(const std::string & text) const {
     const auto segments = build_segments(text);
     MingTinyPromptIds prompt;

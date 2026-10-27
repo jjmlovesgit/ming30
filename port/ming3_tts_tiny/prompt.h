@@ -38,6 +38,11 @@ public:
 
     [[nodiscard]] MingTinyPromptIds build(const std::string & text) const;
 
+    // Podcast form: the reference transcript is inserted before the script and the
+    // reference latents occupy trailing <audioPatch> placeholders.
+    [[nodiscard]] std::vector<std::pair<std::string, std::vector<int32_t>>> build_podcast_segments(
+        const std::string & script, const std::string & reference_text, size_t latent_tokens) const;
+
 private:
     tokenizers::LlamaBpeTokenizer tokenizer_;
     MingTinySpecialTokens tokens_;
