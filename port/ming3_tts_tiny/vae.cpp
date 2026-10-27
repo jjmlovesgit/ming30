@@ -31,6 +31,7 @@ constexpr size_t kHop = 882;
 constexpr size_t kPad = (kFft - kHop) / 2;
 constexpr float kEps = 1e-6f;
 constexpr float kTheta = 1e6f;
+constexpr size_t kWindow = 64;   // Qwen2 sliding window (use_sliding_window=true)
 
 std::string prefix() { return "audio.decoder."; }
 
@@ -248,14 +249,16 @@ void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & la
             trace_weights.assign(kHeads * (traced_token + 1), 0.0f);
             trace_weighted.assign(kHeads * kHeadDim, 0.0f);
         }
-        // full causal attention across every token (matches the Python SDPA run)
+        // sliding-window causal attention: the checkpoint sets use_sliding_window=true with
+        // max_window_layers=0, so every layer attends to at most the last 64 tokens
         const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
         std::vector<float> scores(tokens);
         for (size_t head = 0; head < kHeads; ++head) {
             const size_t kv_head = head / (kHeads / kKvHeads);
             for (size_t token = 0; token < tokens; ++token) {
+                const size_t first_key = (token + 1 > kWindow) ? token + 1 - kWindow : 0;
                 float best = -1e30f;
-                for (size_t key = 0; key <= token; ++key) {
+                for (size_t key = first_key; key <= token; ++key) {
                     float sum = 0.0f;
                     for (size_t dim = 0; dim < kHeadDim; ++dim) {
                         sum += q[token * kHeads * kHeadDim + head * kHeadDim + dim] *
@@ -266,7 +269,7 @@ void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & la
                     if (token_trace && token == traced_token) trace_scores[head * (traced_token + 1) + key] = scores[key];
                 }
                 float total = 0.0f;
-                for (size_t key = 0; key <= token; ++key) {
+                for (size_t key = first_key; key <= token; ++key) {
                     scores[key] = std::exp(scores[key] - best);
                     total += scores[key];
                 }
@@ -277,7 +280,7 @@ void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & la
                 }
                 for (size_t dim = 0; dim < kHeadDim; ++dim) {
                     float sum = 0.0f;
-                    for (size_t key = 0; key <= token; ++key) {
+                    for (size_t key = first_key; key <= token; ++key) {
                         sum += scores[key] / total * v[key * kKvHeads * kHeadDim + kv_head * kHeadDim + dim];
                     }
                     attn[token * kHeads * kHeadDim + head * kHeadDim + dim] = sum;
