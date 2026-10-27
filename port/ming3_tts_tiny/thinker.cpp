@@ -134,7 +134,8 @@ struct Routing {
 // KDA attention for one layer: float32 recurrence. The reference uses FLA's chunk
 // path; the two agree to float32 precision on these inputs.
 void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<float> & input, size_t tokens,
-    std::vector<float> & output, std::vector<float> & attn_only, KdaTrace * trace = nullptr) {
+    std::vector<float> & output, std::vector<float> & attn_only, KdaTrace * trace = nullptr,
+    KdaCache * cache = nullptr) {
     const auto & source = *assets.weights;
     const size_t hidden = static_cast<size_t>(assets.config.hidden_size);
     const std::string prefix = layer_prefix(layer);
@@ -170,9 +171,35 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
         std::memcpy(v_all.data() + time * kProjection, v_row.data(), kProjection * sizeof(float));
     }
     std::vector<float> q_conv, k_conv, v_conv;
-    short_conv_silu(q_all, q_c, tokens, kProjection, 4, q_conv);
-    short_conv_silu(k_all, k_c, tokens, kProjection, 4, k_conv);
-    short_conv_silu(v_all, v_c, tokens, kProjection, 4, v_conv);
+    const bool resume = cache != nullptr && cache->initialized;
+    if (resume) {
+        const auto conv_with_history = [&](const std::vector<float> & row, const std::vector<float> & history) {
+            std::vector<float> buffer(4 * kProjection);
+            std::memcpy(buffer.data(), history.data(), 3 * kProjection * sizeof(float));
+            std::memcpy(buffer.data() + 3 * kProjection, row.data(), kProjection * sizeof(float));
+            return buffer;
+        };
+        const auto q_buf = conv_with_history(q_all, cache->q_hist);
+        const auto k_buf = conv_with_history(k_all, cache->k_hist);
+        const auto v_buf = conv_with_history(v_all, cache->v_hist);
+        std::vector<float> q_tmp, k_tmp, v_tmp;
+        short_conv_silu(q_buf, q_c, 4, kProjection, 4, q_tmp);
+        short_conv_silu(k_buf, k_c, 4, kProjection, 4, k_tmp);
+        short_conv_silu(v_buf, v_c, 4, kProjection, 4, v_tmp);
+        q_conv.assign(q_tmp.end() - kProjection, q_tmp.end());
+        k_conv.assign(k_tmp.end() - kProjection, k_tmp.end());
+        v_conv.assign(v_tmp.end() - kProjection, v_tmp.end());
+        cache->q_hist.erase(cache->q_hist.begin(), cache->q_hist.begin() + kProjection);
+        cache->q_hist.insert(cache->q_hist.end(), q_all.begin(), q_all.end());
+        cache->k_hist.erase(cache->k_hist.begin(), cache->k_hist.begin() + kProjection);
+        cache->k_hist.insert(cache->k_hist.end(), k_all.begin(), k_all.end());
+        cache->v_hist.erase(cache->v_hist.begin(), cache->v_hist.begin() + kProjection);
+        cache->v_hist.insert(cache->v_hist.end(), v_all.begin(), v_all.end());
+    } else {
+        short_conv_silu(q_all, q_c, tokens, kProjection, 4, q_conv);
+        short_conv_silu(k_all, k_c, tokens, kProjection, 4, k_conv);
+        short_conv_silu(v_all, v_c, tokens, kProjection, 4, v_conv);
+    }
     if (trace != nullptr && trace->enabled) {
         trace->q_conv = q_conv;
         trace->k_conv = k_conv;
@@ -203,6 +230,7 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
     std::vector<float> state(kHeads * kHeadDim * kHeadDim, 0.0f);
+    if (resume && cache->state.size() == state.size()) state = cache->state;
     std::vector<float> f(kProjection), g(kProjection), b(kHeads), predicted(kHeadDim);
     std::vector<float> output_all(tokens * kProjection, 0.0f), gated(kProjection), attn(hidden), fused(tokens * hidden);
     for (size_t time = 0; time < tokens; ++time) {
@@ -274,13 +302,31 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
             fused[time * hidden + column] = input[time * hidden + column] + attn[column];
         }
     }
+    if (cache != nullptr) {
+        cache->state = state;
+        if (!resume) {
+            cache->q_hist.assign(kProjection * 3, 0.0f);
+            cache->k_hist.assign(kProjection * 3, 0.0f);
+            cache->v_hist.assign(kProjection * 3, 0.0f);
+            const size_t take = tokens < 3 ? tokens : 3;
+            for (size_t row = 0; row < take; ++row) {
+                const size_t source = (tokens - take + row) * kProjection;
+                const size_t destination = (3 - take + row) * kProjection;
+                std::memcpy(cache->q_hist.data() + destination, q_all.data() + source, kProjection * sizeof(float));
+                std::memcpy(cache->k_hist.data() + destination, k_all.data() + source, kProjection * sizeof(float));
+                std::memcpy(cache->v_hist.data() + destination, v_all.data() + source, kProjection * sizeof(float));
+            }
+        }
+        cache->initialized = true;
+    }
     output = std::move(fused);
 }
 
 // MLA attention: LoRA q/kv projections, interleaved RoPE on the 64-dim slice, causal
 // SDPA, head-wise sigmoid output gate, then the dense projection.
 void run_mla(const MingTinyAssets & assets, size_t layer, const std::vector<float> & input, size_t tokens,
-    std::vector<float> & output, std::vector<float> & attn_only, KdaTrace * trace = nullptr) {
+    std::vector<float> & output, std::vector<float> & attn_only, KdaTrace * trace = nullptr,
+    MlaCache * cache = nullptr) {
     const auto & source = *assets.weights;
     const size_t hidden = static_cast<size_t>(assets.config.hidden_size);
     const size_t heads = kHeads;
@@ -302,6 +348,7 @@ void run_mla(const MingTinyAssets & assets, size_t layer, const std::vector<floa
     std::vector<float> normed;
     rms_norm(input.data(), norm_w.data(), tokens, hidden, normed);
     attn_only.assign(tokens * hidden, 0.0f);
+    const size_t offset = cache != nullptr ? cache->tokens : 0;
 
     std::vector<float> q_all(tokens * heads * qk_head, 0.0f);
     std::vector<float> k_all(tokens * heads * qk_head, 0.0f);
@@ -343,7 +390,7 @@ void run_mla(const MingTinyAssets & assets, size_t layer, const std::vector<floa
     for (size_t time = 0; time < tokens; ++time) {
         for (size_t pair = 0; pair < qk_rope / 2; ++pair) {
             const float inv_freq = std::pow(10000.0f, -2.0f * static_cast<float>(pair) / static_cast<float>(qk_rope));
-            const float angle = static_cast<float>(time) * inv_freq;
+            const float angle = static_cast<float>(offset + time) * inv_freq;
             const float c = std::cos(angle), s = std::sin(angle);
             for (size_t head = 0; head < heads; ++head) {
                 for (int which = 0; which < 2; ++which) {
@@ -357,29 +404,51 @@ void run_mla(const MingTinyAssets & assets, size_t layer, const std::vector<floa
         }
     }
 
+    // With a cache, keys and values of every earlier position are kept; a one-token
+    // step appends its own and attends over the whole history.
+    const std::vector<float> * keys_ptr = &k_all;
+    const std::vector<float> * values_ptr = &v_all;
+    size_t history = tokens;
+    if (cache != nullptr) {
+        const size_t previous = cache->tokens;
+        cache->keys.resize((previous + tokens) * heads * qk_head);
+        cache->values.resize((previous + tokens) * heads * v_head);
+        std::memcpy(cache->keys.data() + previous * heads * qk_head, k_all.data(),
+            tokens * heads * qk_head * sizeof(float));
+        std::memcpy(cache->values.data() + previous * heads * v_head, v_all.data(),
+            tokens * heads * v_head * sizeof(float));
+        cache->tokens = previous + tokens;
+        keys_ptr = &cache->keys;
+        values_ptr = &cache->values;
+        history = cache->tokens;
+    }
+    const auto & keys = *keys_ptr;
+    const auto & values = *values_ptr;
+
     const float scale = 1.0f / std::sqrt(static_cast<float>(qk_head));
     std::vector<float> attention_out(tokens * heads * v_head, 0.0f);
-    std::vector<float> scores(tokens);
+    std::vector<float> scores(history);
     for (size_t time = 0; time < tokens; ++time) {
+        const size_t query_index = offset + time;
         for (size_t head = 0; head < heads; ++head) {
             const float * q = q_all.data() + (time * heads + head) * qk_head;
             float best = -1e30f;
-            for (size_t key = 0; key <= time; ++key) {
-                const float * k = k_all.data() + (key * heads + head) * qk_head;
+            for (size_t key = 0; key <= query_index; ++key) {
+                const float * k = keys.data() + (key * heads + head) * qk_head;
                 float sum = 0.0f;
                 for (size_t dim = 0; dim < qk_head; ++dim) sum += q[dim] * k[dim];
                 scores[key] = sum * scale;
                 best = std::max(best, scores[key]);
             }
             float total = 0.0f;
-            for (size_t key = 0; key <= time; ++key) {
+            for (size_t key = 0; key <= query_index; ++key) {
                 scores[key] = std::exp(scores[key] - best);
                 total += scores[key];
             }
             float * out = attention_out.data() + (time * heads + head) * v_head;
-            for (size_t key = 0; key <= time; ++key) {
+            for (size_t key = 0; key <= query_index; ++key) {
                 const float weight = scores[key] / total;
-                const float * v = v_all.data() + (key * heads + head) * v_head;
+                const float * v = values.data() + (key * heads + head) * v_head;
                 for (size_t dim = 0; dim < v_head; ++dim) out[dim] += weight * v[dim];
             }
         }
@@ -584,15 +653,19 @@ private:
 
 }  // namespace
 
-void thinker_forward_embeds(const MingTinyAssets & assets, const std::vector<float> & embeds, size_t tokens,
-    std::vector<float> & final_norm) {
+namespace {
+
+void run_all_layers(const MingTinyAssets & assets, const std::vector<float> & embeds, size_t tokens,
+    ThinkerCache * cache, std::vector<float> & final_norm) {
     std::vector<float> state = embeds;
     for (size_t layer = 0; layer < static_cast<size_t>(assets.config.layers); ++layer) {
         std::vector<float> after_attention, attention_only;
         if (layer % 4 == 3) {
-            run_mla(assets, layer, state, tokens, after_attention, attention_only);
+            MlaCache * mla = cache != nullptr ? &cache->mla[layer] : nullptr;
+            run_mla(assets, layer, state, tokens, after_attention, attention_only, nullptr, mla);
         } else {
-            run_kda(assets, layer, state, tokens, after_attention, attention_only, nullptr);
+            KdaCache * kda = cache != nullptr ? &cache->kda[layer] : nullptr;
+            run_kda(assets, layer, state, tokens, after_attention, attention_only, nullptr, kda);
         }
         std::vector<float> after_block;
         if (layer < static_cast<size_t>(assets.config.first_k_dense_replace)) {
@@ -607,6 +680,25 @@ void thinker_forward_embeds(const MingTinyAssets & assets, const std::vector<flo
     const auto norm_weight = load_float(*assets.weights, "model.norm.weight",
         {static_cast<int64_t>(assets.config.hidden_size)});
     rms_norm(state.data(), norm_weight.data(), tokens, static_cast<size_t>(assets.config.hidden_size), final_norm);
+}
+
+}  // namespace
+
+void thinker_forward_embeds(const MingTinyAssets & assets, const std::vector<float> & embeds, size_t tokens,
+    std::vector<float> & final_norm) {
+    run_all_layers(assets, embeds, tokens, nullptr, final_norm);
+}
+
+void thinker_prefill_cached(const MingTinyAssets & assets, const std::vector<float> & embeds, size_t tokens,
+    ThinkerCache & cache, std::vector<float> & final_norm) {
+    cache.kda.assign(static_cast<size_t>(assets.config.layers), KdaCache{});
+    cache.mla.assign(static_cast<size_t>(assets.config.layers), MlaCache{});
+    run_all_layers(assets, embeds, tokens, &cache, final_norm);
+}
+
+void thinker_step_cached(const MingTinyAssets & assets, const std::vector<float> & embed,
+    ThinkerCache & cache, std::vector<float> & final_norm) {
+    run_all_layers(assets, embed, 1, &cache, final_norm);
 }
 
 void dump_thinker_probe(const MingTinyAssets & assets, const std::vector<int32_t> & prompt_ids,

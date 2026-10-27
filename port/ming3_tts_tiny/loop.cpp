@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <numeric>
 #include <stdexcept>
@@ -194,6 +195,51 @@ private:
 };
 
 }  // namespace
+
+void run_cache_check(const MingTinyAssets & assets, const std::vector<float> & embeds, size_t tokens,
+    size_t prefill_tokens) {
+    if (prefill_tokens >= tokens) throw std::runtime_error("cache check: prefill must be shorter than the sequence");
+    const auto clock = [] { return std::chrono::steady_clock::now(); };
+    const auto elapsed = [](auto from, auto to) {
+        return std::chrono::duration<double>(to - from).count();
+    };
+
+    std::vector<float> full;
+    auto start_full = clock();
+    thinker_forward_embeds(assets, embeds, tokens, full);
+    const double full_seconds = elapsed(start_full, clock());
+
+    ThinkerCache cache;
+    std::vector<float> prefill_final;
+    std::vector<float> head(embeds.begin(), embeds.begin() + static_cast<long>(prefill_tokens) * kHiddenLlm);
+    auto start_cached = clock();
+    thinker_prefill_cached(assets, head, prefill_tokens, cache, prefill_final);
+    const double prefill_seconds = elapsed(start_cached, clock());
+
+    std::vector<float> stepped;
+    auto start_steps = clock();
+    for (size_t index = prefill_tokens; index < tokens; ++index) {
+        std::vector<float> row(embeds.begin() + static_cast<long>(index) * kHiddenLlm,
+                               embeds.begin() + static_cast<long>(index + 1) * kHiddenLlm);
+        thinker_step_cached(assets, row, cache, stepped);
+    }
+    const double step_seconds = elapsed(start_steps, clock());
+    std::printf("  cache timings   : full %.1f s | prefill %.1f s + %zu steps %.1f s (%.2f s/step)\n",
+        full_seconds, prefill_seconds, tokens - prefill_tokens, step_seconds,
+        step_seconds / static_cast<double>(tokens - prefill_tokens));
+    double max_abs = 0.0;
+    double sum = 0.0, reference = 0.0;
+    for (size_t index = 0; index < kHiddenLlm; ++index) {
+        const double difference = static_cast<double>(stepped[index]) - static_cast<double>(full[full.size() - kHiddenLlm + index]);
+        max_abs = std::max(max_abs, std::abs(difference));
+        sum += difference * difference;
+        const double value = full[full.size() - kHiddenLlm + index];
+        reference += value * value;
+    }
+    std::printf("  cache check     : tokens=%zu (prefill %zu + %zu steps) last-token max_abs=%.3e rel_rmse=%.3e\n",
+        tokens, prefill_tokens, tokens - prefill_tokens, max_abs,
+        std::sqrt(sum / (reference > 0.0 ? reference : 1.0)));
+}
 
 void run_loop_patch_seeded(const MingTinyAssets & assets, const std::vector<float> & embeds, size_t tokens,
     const std::vector<float> & noise, const std::vector<float> & history, float cfg, int flow_steps,

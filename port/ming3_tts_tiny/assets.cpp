@@ -216,6 +216,19 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
             std::printf("  seeded patch    : tokens=%zu latent_rms=%.6f\n", embeds.size() / 1536,
                 std::sqrt(std::inner_product(latent.begin(), latent.end(), latent.begin(), 0.0) / 64.0));
         }
+
+        // Cache verification: full recompute vs prefill + one-token steps.
+        if (const char * cache_file = std::getenv("MING3_TINY_CACHE_CHECK"); cache_file != nullptr && *cache_file != '\0') {
+            std::ifstream in(cache_file, std::ios::binary | std::ios::ate);
+            if (!in) throw std::runtime_error(std::string("cannot open ") + cache_file);
+            const auto bytes = static_cast<size_t>(in.tellg());
+            in.seekg(0);
+            std::vector<float> embeds(bytes / sizeof(float));
+            in.read(reinterpret_cast<char *>(embeds.data()), static_cast<std::streamsize>(bytes));
+            size_t prefill = 41;
+            if (const char * p = std::getenv("MING3_TINY_CACHE_PREFILL"); p != nullptr) prefill = static_cast<size_t>(std::atoi(p));
+            run_cache_check(*assets, embeds, embeds.size() / 1536, prefill);
+        }
     } catch (const std::exception & error) {
         std::printf("  prompt stage A  : FAILED: %s\n", error.what());
     }
