@@ -1,4 +1,5 @@
 #include "engine/models/ming3_tts_tiny/thinker.h"
+#include "engine/models/ming3_tts_tiny/gpu_bench.h"
 
 #include <algorithm>
 #include <cmath>
@@ -770,77 +771,57 @@ void thinker_step_cached(const MingTinyAssets & assets, const std::vector<float>
     run_all_layers(assets, embed, 1, &cache, final_norm);
 }
 
-#if defined(ENGINE_HAS_MING_GPU_BENCH)
-extern "C" int ming_gpu_layer_benchmark(const float * q_w, const float * k_w, const float * v_w,
-    const float * f_w, const float * g_w, const float * b_w, const float * o_w, const float * x,
-    int iterations, double * out);
-#endif
-
 void run_gpu_layer_benchmark(const MingTinyAssets & assets, int iterations) {
     constexpr size_t kHiddenLlm = 1536;
+    constexpr size_t kProjectionLlm = 2048;
 #if !defined(ENGINE_HAS_MING_GPU_BENCH)
-    std::printf("  gpu benchmark   : not built with CUDA\n");
+    std::printf("  gpu gemm        : not built with CUDA\n");
     (void) assets;
     (void) iterations;
 #else
     const auto & source = *assets.weights;
-    const std::string prefix = "model.layers.0.attention.";
-    const Shape projection{static_cast<int64_t>(kProjection), static_cast<int64_t>(kHiddenLlm)};
-    const auto q_w = load_float(source, prefix + "q_proj.weight", projection);
-    const auto k_w = load_float(source, prefix + "k_proj.weight", projection);
-    const auto v_w = load_float(source, prefix + "v_proj.weight", projection);
-    const auto f_w = load_float(source, prefix + "f_proj.weight", projection);
-    const auto g_w = load_float(source, prefix + "g_proj.weight", projection);
-    const auto b_w = load_float(source, prefix + "b_proj.weight",
-        {static_cast<int64_t>(kHeads), static_cast<int64_t>(kHiddenLlm)});
-    const auto o_w = load_float(source, prefix + "o_proj.weight",
-        {static_cast<int64_t>(kHiddenLlm), static_cast<int64_t>(kProjection)});
+    const auto q_w = load_float(source, "model.layers.0.attention.q_proj.weight",
+        {static_cast<int64_t>(kProjectionLlm), static_cast<int64_t>(kHiddenLlm)});
 
+    // known, finite, non-symmetric input so a transposed or mis-strided GEMM cannot pass
     std::vector<float> x(kHiddenLlm);
-    for (size_t index = 0; index < x.size(); ++index) x[index] = 0.01f * static_cast<float>((index % 17) - 8);
-
-    // CPU reference for the same seven products
-    std::vector<float> cpu_out(kHiddenLlm, 0.0f), q(projection.size() / 2, 0.0f), buffer(kProjection);
-    const auto cpu_start = std::chrono::steady_clock::now();
-    for (int iteration = 0; iteration < iterations; ++iteration) {
-        linear(x.data(), q_w.data(), kHiddenLlm, kProjection, buffer.data());
-        linear(x.data(), k_w.data(), kHiddenLlm, kProjection, buffer.data());
-        linear(x.data(), v_w.data(), kHiddenLlm, kProjection, buffer.data());
-        linear(x.data(), f_w.data(), kHiddenLlm, kProjection, buffer.data());
-        linear(x.data(), g_w.data(), kHiddenLlm, kProjection, buffer.data());
-        std::vector<float> b_out(kHeads);
-        linear(x.data(), b_w.data(), kHiddenLlm, kHeads, b_out.data());
-        std::vector<float> o_out(kHiddenLlm);
-        linear(buffer.data(), o_w.data(), kProjection, kHiddenLlm, o_out.data());
-        for (size_t index = 0; index < kHiddenLlm; ++index) cpu_out[index] = o_out[index];
+    for (size_t index = 0; index < x.size(); ++index) {
+        x[index] = 0.5f * std::sin(0.01f * static_cast<float>(index)) + 0.1f * static_cast<float>(index % 7) - 0.3f;
     }
-    const double cpu_ms =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpu_start).count() /
-        std::max(iterations, 1);
 
-    double timings[6] = {0, 0, 0, 0, 0, 0};
-    const int status = ming_gpu_layer_benchmark(q_w.data(), k_w.data(), v_w.data(), f_w.data(), g_w.data(),
-        b_w.data(), o_w.data(), x.data(), iterations, timings);
+    std::vector<float> reference(kProjectionLlm);
+    linear(x.data(), q_w.data(), kHiddenLlm, kProjectionLlm, reference.data());
+
+    std::vector<float> gpu(kProjectionLlm, 0.0f);
+    double timings[4] = {0, 0, 0, 0};
+    const int status = ming_gpu_gemm(q_w.data(), x.data(), static_cast<int>(kProjectionLlm),
+        static_cast<int>(kHiddenLlm), iterations, gpu.data(), timings);
     if (status != 0) {
-        std::printf("  gpu benchmark   : cublas init failed\n");
+        std::printf("  gpu gemm        : cuBLAS initialisation failed\n");
         return;
     }
-    std::printf("  gpu benchmark   : %d iterations, one KDA layer at the decode shape\n", iterations);
-    std::printf("    weight upload : %8.2f ms (one-time, %.0f MiB VRAM)\n", timings[0], timings[4]);
-    std::printf("    per call xfer : %8.3f ms\n", timings[1]);
-    std::printf("    per call gemm : %8.3f ms\n", timings[2]);
-    std::printf("    per call total: %8.3f ms   (cpu same products: %.3f ms)\n", timings[3], cpu_ms);
-    {
-        double weight_sum = 0.0, weight_sq = 0.0, out_sq = 0.0;
-        for (float value : q_w) { weight_sum += value; weight_sq += static_cast<double>(value) * value; }
-        for (float value : cpu_out) { out_sq += static_cast<double>(value) * value; }
-        std::printf("    diagnostics   : |q_w| rms=%.6f mean=%.6f |cpu_out| rms=%.6f |gpu_out| rms=%.6f\n",
-            std::sqrt(weight_sq / q_w.size()), weight_sum / q_w.size(),
-            std::sqrt(out_sq / cpu_out.size()),
-            std::sqrt(static_cast<double>(timings[5]) * timings[5] / cpu_out.size()));
+
+    double max_abs = 0.0, sum_sq = 0.0, reference_sq = 0.0;
+    size_t mismatched = 0;
+    for (size_t index = 0; index < reference.size(); ++index) {
+        const double difference = static_cast<double>(gpu[index]) - reference[index];
+        max_abs = std::max(max_abs, std::abs(difference));
+        sum_sq += difference * difference;
+        reference_sq += static_cast<double>(reference[index]) * reference[index];
+        const double tolerance = 1e-4 * std::max(1.0, static_cast<double>(std::abs(reference[index])));
+        if (std::abs(difference) > tolerance) ++mismatched;
     }
-    std::printf("    gpu checksum  : %12.4f   cpu checksum: %12.4f\n", timings[5],
-        std::accumulate(cpu_out.begin(), cpu_out.end(), 0.0));
+    const double relative = std::sqrt(sum_sq / (reference_sq > 0.0 ? reference_sq : 1.0));
+
+    std::printf("  gpu gemm        : one projection %zux%zu, %d iterations\n", kProjectionLlm, kHiddenLlm,
+        iterations);
+    std::printf("    weight upload : %8.3f ms (%.0f MiB VRAM for this matrix)\n", timings[0], timings[3]);
+    std::printf("    xfer per call : %8.3f ms\n", timings[1]);
+    std::printf("    gemm per call : %8.3f ms\n", timings[2]);
+    std::printf("    verification  : max_abs=%.3e rel_rmse=%.3e mismatched=%zu/%zu  %s\n", max_abs, relative,
+        mismatched, reference.size(), (mismatched == 0 && relative < 1e-5) ? "PASS" : "FAIL");
+    std::printf("    values        : cpu[0..3]=%.6f %.6f %.6f %.6f | gpu[0..3]=%.6f %.6f %.6f %.6f\n",
+        reference[0], reference[1], reference[2], reference[3], gpu[0], gpu[1], gpu[2], gpu[3]);
 #endif
 }
 
