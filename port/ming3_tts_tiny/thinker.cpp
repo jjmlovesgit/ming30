@@ -229,6 +229,129 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
     output = std::move(fused);
 }
 
+// MLA attention: LoRA q/kv projections, interleaved RoPE on the 64-dim slice, causal
+// SDPA, head-wise sigmoid output gate, then the dense projection.
+void run_mla(const MingTinyAssets & assets, size_t layer, const std::vector<float> & input, size_t tokens,
+    std::vector<float> & output) {
+    const auto & source = *assets.weights;
+    const size_t hidden = static_cast<size_t>(assets.config.hidden_size);
+    const size_t heads = kHeads;
+    const size_t qk_nope = 128, qk_rope = 64, v_head = 128;
+    const size_t q_lora = 256, kv_lora = 512;
+    const size_t qk_head = qk_nope + qk_rope;
+    const std::string prefix = layer_prefix(layer);
+
+    const auto norm_w = load_float(source, prefix + "input_layernorm.weight", {static_cast<int64_t>(hidden)});
+    const auto q_a = load_float(source, prefix + "attention.q_a_proj.weight", {static_cast<int64_t>(q_lora), static_cast<int64_t>(hidden)});
+    const auto q_a_norm = load_float(source, prefix + "attention.q_a_layernorm.weight", {static_cast<int64_t>(q_lora)});
+    const auto q_b = load_float(source, prefix + "attention.q_b_proj.weight", {static_cast<int64_t>(heads * qk_head), static_cast<int64_t>(q_lora)});
+    const auto kv_a = load_float(source, prefix + "attention.kv_a_proj_with_mqa.weight", {static_cast<int64_t>(kv_lora + qk_rope), static_cast<int64_t>(hidden)});
+    const auto kv_a_norm = load_float(source, prefix + "attention.kv_a_layernorm.weight", {static_cast<int64_t>(kv_lora)});
+    const auto kv_b = load_float(source, prefix + "attention.kv_b_proj.weight", {static_cast<int64_t>(heads * (qk_nope + v_head)), static_cast<int64_t>(kv_lora)});
+    const auto g_w = load_float(source, prefix + "attention.g_proj.weight", {static_cast<int64_t>(heads), static_cast<int64_t>(hidden)});
+    const auto dense = load_float(source, prefix + "attention.dense.weight", {static_cast<int64_t>(hidden), static_cast<int64_t>(heads * v_head)});
+
+    std::vector<float> normed;
+    rms_norm(input.data(), norm_w.data(), tokens, hidden, normed);
+
+    std::vector<float> q_all(tokens * heads * qk_head, 0.0f);
+    std::vector<float> k_all(tokens * heads * qk_head, 0.0f);
+    std::vector<float> v_all(tokens * heads * v_head, 0.0f);
+    std::vector<float> qa(q_lora), qn(q_lora), q_full(heads * qk_head);
+    std::vector<float> kvrow(kv_lora + qk_rope), kvn(kv_lora), kv_full(heads * (qk_nope + v_head));
+    for (size_t time = 0; time < tokens; ++time) {
+        const float * row = normed.data() + time * hidden;
+        linear(row, q_a.data(), hidden, q_lora, qa.data());
+        double qsum = 0.0;
+        for (size_t index = 0; index < q_lora; ++index) qsum += static_cast<double>(qa[index]) * qa[index];
+        const float qinv = 1.0f / std::sqrt(static_cast<float>(qsum / static_cast<double>(q_lora)) + kEps);
+        for (size_t index = 0; index < q_lora; ++index) qn[index] = qa[index] * qinv * q_a_norm[index];
+        linear(qn.data(), q_b.data(), q_lora, heads * qk_head, q_full.data());
+
+        linear(row, kv_a.data(), hidden, kv_lora + qk_rope, kvrow.data());
+        double kvsum = 0.0;
+        for (size_t index = 0; index < kv_lora; ++index) kvsum += static_cast<double>(kvrow[index]) * kvrow[index];
+        const float kv_inv = 1.0f / std::sqrt(static_cast<float>(kvsum / static_cast<double>(kv_lora)) + kEps);
+        for (size_t index = 0; index < kv_lora; ++index) kvn[index] = kvrow[index] * kv_inv * kv_a_norm[index];
+        linear(kvn.data(), kv_b.data(), kv_lora, heads * (qk_nope + v_head), kv_full.data());
+
+        for (size_t head = 0; head < heads; ++head) {
+            for (size_t dim = 0; dim < qk_nope; ++dim) {
+                q_all[(time * heads + head) * qk_head + dim] = q_full[head * qk_head + dim];
+                k_all[(time * heads + head) * qk_head + dim] = kv_full[head * (qk_nope + v_head) + dim];
+            }
+            for (size_t dim = 0; dim < qk_rope; ++dim) {
+                q_all[(time * heads + head) * qk_head + qk_nope + dim] = q_full[head * qk_head + qk_nope + dim];
+                k_all[(time * heads + head) * qk_head + qk_nope + dim] = kvrow[kv_lora + dim];
+            }
+            for (size_t dim = 0; dim < v_head; ++dim) {
+                v_all[(time * heads + head) * v_head + dim] = kv_full[head * (qk_nope + v_head) + qk_nope + dim];
+            }
+        }
+    }
+
+    // interleaved RoPE on the rotary slice (rope_interleave=True)
+    for (size_t time = 0; time < tokens; ++time) {
+        for (size_t pair = 0; pair < qk_rope / 2; ++pair) {
+            const float inv_freq = std::pow(10000.0f, -2.0f * static_cast<float>(pair) / static_cast<float>(qk_rope));
+            const float angle = static_cast<float>(time) * inv_freq;
+            const float c = std::cos(angle), s = std::sin(angle);
+            for (size_t head = 0; head < heads; ++head) {
+                for (int which = 0; which < 2; ++which) {
+                    std::vector<float> & vec = which == 0 ? q_all : k_all;
+                    float * base = vec.data() + (time * heads + head) * qk_head + qk_nope;
+                    const float x1 = base[2 * pair], x2 = base[2 * pair + 1];
+                    base[2 * pair] = x1 * c - x2 * s;
+                    base[2 * pair + 1] = x1 * s + x2 * c;
+                }
+            }
+        }
+    }
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(qk_head));
+    std::vector<float> attention_out(tokens * heads * v_head, 0.0f);
+    std::vector<float> scores(tokens);
+    for (size_t time = 0; time < tokens; ++time) {
+        for (size_t head = 0; head < heads; ++head) {
+            const float * q = q_all.data() + (time * heads + head) * qk_head;
+            float best = -1e30f;
+            for (size_t key = 0; key <= time; ++key) {
+                const float * k = k_all.data() + (key * heads + head) * qk_head;
+                float sum = 0.0f;
+                for (size_t dim = 0; dim < qk_head; ++dim) sum += q[dim] * k[dim];
+                scores[key] = sum * scale;
+                best = std::max(best, scores[key]);
+            }
+            float total = 0.0f;
+            for (size_t key = 0; key <= time; ++key) {
+                scores[key] = std::exp(scores[key] - best);
+                total += scores[key];
+            }
+            float * out = attention_out.data() + (time * heads + head) * v_head;
+            for (size_t key = 0; key <= time; ++key) {
+                const float weight = scores[key] / total;
+                const float * v = v_all.data() + (key * heads + head) * v_head;
+                for (size_t dim = 0; dim < v_head; ++dim) out[dim] += weight * v[dim];
+            }
+        }
+    }
+
+    std::vector<float> gated(heads * v_head), attn(hidden), fused(tokens * hidden);
+    std::vector<float> gate_scores(heads), row_out(hidden);
+    for (size_t time = 0; time < tokens; ++time) {
+        linear(normed.data() + time * hidden, g_w.data(), hidden, heads, gate_scores.data());
+        for (size_t index = 0; index < gated.size(); ++index) {
+            const size_t head = index / v_head;
+            gated[index] = attention_out[time * heads * v_head + index] * sigmoid(gate_scores[head]);
+        }
+        linear(gated.data(), dense.data(), heads * v_head, hidden, attn.data());
+        for (size_t column = 0; column < hidden; ++column) {
+            fused[time * hidden + column] = input[time * hidden + column] + attn[column];
+        }
+    }
+    output = std::move(fused);
+}
+
 void run_dense_mlp(const MingTinyAssets & assets, size_t layer, const std::vector<float> & input, size_t tokens,
     std::vector<float> & output) {
     const auto & source = *assets.weights;
@@ -421,10 +544,14 @@ void dump_thinker_probe(const MingTinyAssets & assets, const std::vector<int32_t
     }
     writer.add("embedding", state, {1, static_cast<int64_t>(tokens), static_cast<int64_t>(hidden)});
 
-    const size_t limit = std::min<size_t>(layers, 2);  // layers 0 and 1 for now
+    const size_t limit = std::min<size_t>(layers, 4);  // layers 0-2 KDA, layer 3 first MLA
     for (size_t layer = 0; layer < limit; ++layer) {
         std::vector<float> after_attention;
-        run_kda(assets, layer, state, tokens, after_attention);
+        if (layer % 4 == 3) {
+            run_mla(assets, layer, state, tokens, after_attention);
+        } else {
+            run_kda(assets, layer, state, tokens, after_attention);
+        }
         std::vector<float> after_block;
         if (layer < static_cast<size_t>(assets.config.first_k_dense_replace)) {
             run_dense_mlp(assets, layer, after_attention, tokens, after_block);

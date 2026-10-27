@@ -107,17 +107,52 @@ def main() -> int:
             print(f"{name:<14} reference has no such capture")
             continue
         if cpp_captures[name].dtype.kind == "i":
+            # The routed sum is a sum over slots, so the model is invariant to the
+            # order of near-tied experts. Compare the selected *set* as the failure
+            # condition and report order differences separately.
             reference_ids = ref_npz[name].astype(np.int64)
             actual_ids = cpp_captures[name].astype(np.int64)
-            mismatches = int((reference_ids != actual_ids).any(axis=-1).sum())
             total = int(reference_ids.shape[0])
-            status = "PASS" if mismatches == 0 else "FAIL"
-            print(f"{status:<5} {name:<24} token rows matching={total - mismatches}/{total}")
-            if mismatches and status == "FAIL" and first_failure is None:
+            order_differences = int((reference_ids != actual_ids).any(axis=-1).sum())
+            set_mismatches = 0
+            for token in range(total):
+                if set(reference_ids[token].tolist()) != set(actual_ids[token].tolist()):
+                    set_mismatches += 1
+            status = "PASS" if set_mismatches == 0 else "FAIL"
+            note = f"order differs on {order_differences}/{total} token(s), same experts" if order_differences and not set_mismatches else ""
+            print(f"{status:<5} {name:<24} expert sets matching={total - set_mismatches}/{total} {note}")
+            if set_mismatches and first_failure is None:
                 first_failure = name
-                bad = int(np.argmax((reference_ids != actual_ids).any(axis=-1)))
-                print(f"      first differing token {bad}: reference {reference_ids[bad].tolist()} "
-                      f"vs cpp {actual_ids[bad].tolist()}")
+                for token in range(total):
+                    if set(reference_ids[token].tolist()) != set(actual_ids[token].tolist()):
+                        print(f"      token {token}: reference {sorted(reference_ids[token].tolist())} "
+                              f"vs cpp {sorted(actual_ids[token].tolist())}")
+                        break
+            continue
+
+        weight_match = re.match(r"routing_layer_(\d+)_weights$", name)
+        if weight_match:
+            # Match weights by expert id, not by slot: a slot swap must not read as a
+            # weight error.
+            layer = weight_match.group(1)
+            ref_ids = ref_npz[f"routing_layer_{layer}_ids"].astype(np.int64)
+            cpp_ids = cpp_captures[f"routing_layer_{layer}_ids"].astype(np.int64)
+            ref_w = ref_npz[name].astype(np.float64)
+            cpp_w = cpp_captures[name].astype(np.float64)
+            worst, worst_token = 0.0, -1
+            for token in range(ref_ids.shape[0]):
+                reference_map = dict(zip(ref_ids[token].tolist(), ref_w[token].tolist()))
+                cpp_map = dict(zip(cpp_ids[token].tolist(), cpp_w[token].tolist()))
+                for expert, value in reference_map.items():
+                    if expert in cpp_map:
+                        gap = abs(cpp_map[expert] - value)
+                        if gap > worst:
+                            worst, worst_token = gap, token
+            status = "PASS" if worst <= 2e-2 else "FAIL"
+            print(f"{status:<5} {name:<24} max_abs by expert id={worst:.3e}"
+                  + (f" (token {worst_token})" if worst_token >= 0 else ""))
+            if status == "FAIL" and first_failure is None:
+                first_failure = name
             continue
         threshold = THRESHOLDS.get(name, THRESHOLDS["default"])
         row = compare(name, ref_npz[name], cpp_captures[name], threshold)
