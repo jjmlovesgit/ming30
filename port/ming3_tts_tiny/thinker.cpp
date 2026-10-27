@@ -558,7 +558,7 @@ void dump_thinker_probe(const MingTinyAssets & assets, const std::vector<int32_t
     // Seeded mode: start from a captured hidden state instead of the embedding, so a
     // later layer can be judged independently of error inherited from earlier layers.
     size_t first_layer = 0;
-    const size_t limit = std::min<size_t>(layers, 4);
+    const size_t limit = layers;  // all 24: 18 KDA + 6 MLA
     if (const char * seed_path = std::getenv("MING3_TINY_SEED_STATE");
         seed_path != nullptr && *seed_path != '\0') {
         std::ifstream in(seed_path, std::ios::binary);
@@ -599,6 +599,18 @@ void dump_thinker_probe(const MingTinyAssets & assets, const std::vector<int32_t
         writer.add("layer_" + std::to_string(layer), state,
             {1, static_cast<int64_t>(tokens), static_cast<int64_t>(hidden)});
     }
+    // final norm and stop head, so the whole thinker can be judged end to end
+    const auto final_norm_w = load_float(*assets.weights, "model.norm.weight", {static_cast<int64_t>(hidden)});
+    std::vector<float> final_norm;
+    rms_norm(state.data(), final_norm_w.data(), tokens, hidden, final_norm);
+    writer.add("final_norm", final_norm, {1, static_cast<int64_t>(tokens), static_cast<int64_t>(hidden)});
+
+    const auto stop_w = load_float(*assets.weights, "stop_head.weight", {2, static_cast<int64_t>(hidden)});
+    const auto stop_b = load_float(*assets.weights, "stop_head.bias", {2});
+    std::vector<float> stop_logits(2, 0.0f);
+    linear(final_norm.data() + (tokens - 1) * hidden, stop_w.data(), hidden, 2, stop_logits.data());
+    for (size_t index = 0; index < stop_logits.size(); ++index) stop_logits[index] += stop_b[index];
+    writer.add("stop_logits", stop_logits, {1, 2});
     writer.manifest(prompt_ids);
 }
 
