@@ -922,11 +922,14 @@ void run_gpu_moe_benchmark(const MingTinyAssets & assets, int iterations) {
     double total_gemm = 0.0, total_xfer = 0.0;
     bool all_pass = true;
 
+    double slice_ms = 0.0;
     for (size_t slot = 0; slot < 8; ++slot) {
         const size_t expert = static_cast<size_t>(experts[slot]);
+        const auto slice_start = std::chrono::steady_clock::now();
         const auto gate_w = slice(gate_bank, expert, kInter * kHiddenLlm);
         const auto up_w = slice(up_bank, expert, kInter * kHiddenLlm);
         const auto down_w = slice(down_bank, expert, kHiddenLlm * kInter);
+        slice_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slice_start).count();
 
         std::vector<float> g(kInter), u(kInter), act(kInter), y_cpu(kHiddenLlm);
         linear(x.data(), gate_w.data(), kHiddenLlm, kInter, g.data());
@@ -980,6 +983,9 @@ void run_gpu_moe_benchmark(const MingTinyAssets & assets, int iterations) {
         std::sqrt(combined_sq / (combined_ref > 0.0 ? combined_ref : 1.0)));
     std::printf("    8 experts     : compute %.3f ms  transfer %.3f ms  sum %.3f ms\n", total_gemm,
         total_xfer, total_gemm + total_xfer);
+    std::printf("    host slicing  : %.3f ms to extract 8 experts x 3 matrices (f32)\n", slice_ms);
+    std::printf("    hybrid note   : slicing + f32 upload per layer would cost %.3f ms per MoE layer\n",
+        slice_ms + total_xfer);
     std::printf("    verdict       : %s\n", all_pass ? "all selected experts PASS" : "FAILURES present");
 #endif
 }
