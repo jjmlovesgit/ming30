@@ -1,0 +1,331 @@
+{
+  "schema_version": 1,
+  "family": "ming3_tts_tiny",
+  "display_name": "Ming 3.0 TTS Tiny",
+  "description": "Dialogue-capable multilingual TTS: Bailing-MoE-V3 backbone (7.9B total / 1.3B active), flow-matching head, audio VAE, CAMPPlus conditioning. Adds the upstream multi-speaker podcast task.",
+  "category": "tts",
+  "status": "experimental",
+  "tasks": [
+    "tts",
+    "clone",
+    "design"
+  ],
+  "modes": [
+    "offline"
+  ],
+  "languages": [
+    "zh",
+    "en",
+    "ja",
+    "ko",
+    "de",
+    "fr",
+    "es"
+  ],
+  "capabilities": {
+    "tts": [
+      "speaker_reference",
+      "style_control",
+      "emotion_control",
+      "built_in_voices"
+    ],
+    "clone": [
+      "speaker_reference",
+      "style_control",
+      "emotion_control"
+    ],
+    "design": [
+      "voice_design"
+    ]
+  },
+  "runtime": {
+    "tags": [
+      "gguf"
+    ]
+  },
+  "options": {
+    "request": [
+      {
+        "name": "template_name",
+        "type": "enum",
+        "required": false,
+        "description": "Upstream task mode. podcast is the only multi-speaker mode.",
+        "values": [
+          "seed",
+          "multilingual",
+          "podcast",
+          "paralinguistic",
+          "basic",
+          "emotion",
+          "dialect",
+          "ip",
+          "voice_design",
+          "freeform"
+        ]
+      },
+      {
+        "name": "language",
+        "type": "string",
+        "required": false,
+        "description": "Target language name or code."
+      },
+      {
+        "name": "instruct",
+        "type": "string",
+        "required": false,
+        "description": "Voice description for voice_design, raw instruction for freeform, optional conditioning for tts. Upstream names this field instruction."
+      },
+      {
+        "name": "emotion",
+        "type": "string",
+        "required": false,
+        "description": "Emotion label for the emotion template."
+      },
+      {
+        "name": "dialect",
+        "type": "enum",
+        "required": false,
+        "description": "Dialect for the dialect template.",
+        "values": [
+          "chuanyu dialect",
+          "cantonese"
+        ]
+      },
+      {
+        "name": "speed",
+        "type": "enum",
+        "required": false,
+        "description": "Categorical speaking speed for the basic template.",
+        "values": [
+          "慢速",
+          "中速",
+          "快速"
+        ]
+      },
+      {
+        "name": "pitch",
+        "type": "enum",
+        "required": false,
+        "description": "Categorical pitch for the basic template.",
+        "values": [
+          "低",
+          "中",
+          "高"
+        ]
+      },
+      {
+        "name": "volume",
+        "type": "enum",
+        "required": false,
+        "description": "Categorical volume for the basic template.",
+        "values": [
+          "低",
+          "中",
+          "高"
+        ]
+      },
+      {
+        "name": "voice_id",
+        "type": "enum",
+        "required": false,
+        "description": "Built-in voice for the ip template.",
+        "values": [
+          "US_Emma",
+          "US_James",
+          "UK_George",
+          "UK_Charlotte"
+        ]
+      },
+      {
+        "name": "reference_text",
+        "type": "string",
+        "required": false,
+        "description": "Transcript accompanying reference audio. For podcast this is the tagged multi-speaker transcript."
+      },
+      {
+        "name": "voice_samples",
+        "type": "path_list",
+        "required": false,
+        "description": "Podcast references, positional: one wav per speaker."
+      },
+      {
+        "name": "use_speaker_embedding",
+        "type": "bool",
+        "required": false,
+        "default": true,
+        "description": "Condition on the reference speaker embedding."
+      },
+      {
+        "name": "zero_speaker_embedding",
+        "type": "bool",
+        "required": false,
+        "default": false,
+        "description": "Use a zero projected speaker row instead of reference conditioning."
+      },
+      {
+        "name": "max_tokens",
+        "type": "int",
+        "required": false,
+        "min": 1,
+        "description": "Maximum generated acoustic patches per fragment."
+      },
+      {
+        "name": "guidance_scale",
+        "type": "float",
+        "required": false,
+        "default": 2,
+        "description": "Flow guidance scale."
+      },
+      {
+        "name": "sigma",
+        "type": "float",
+        "required": false,
+        "default": 0.25,
+        "min": 0,
+        "description": "Flow SDE noise scale."
+      },
+      {
+        "name": "temperature",
+        "type": "float",
+        "required": false,
+        "default": 0,
+        "min": 0,
+        "description": "Flow sampling temperature."
+      },
+      {
+        "name": "flow_steps",
+        "type": "int",
+        "required": false,
+        "default": 10,
+        "min": 1,
+        "description": "Euler steps for the flow head."
+      },
+      {
+        "name": "seed",
+        "type": "int",
+        "required": false,
+        "default": 1895,
+        "min": 0,
+        "description": "Reference-posterior and generation noise seed. The podcast template uses 1235."
+      },
+      {
+        "name": "raw_text",
+        "type": "bool",
+        "required": false,
+        "default": false,
+        "description": "Send the text as one fragment without frontend chunking. Must stay off for podcast."
+      },
+      {
+        "name": "text_chunk_size",
+        "type": "int",
+        "required": false,
+        "min": 1,
+        "description": "Framework long-form chunk budget in Unicode codepoints."
+      },
+      {
+        "name": "text_chunk_mode",
+        "type": "enum",
+        "required": false,
+        "default": "tag_aware",
+        "description": "Framework text chunking policy.",
+        "values": [
+          "default",
+          "tag_aware",
+          "japanese",
+          "endline"
+        ]
+      },
+      {
+        "name": "trim_silence",
+        "type": "bool",
+        "required": false,
+        "default": true,
+        "description": "Trim trailing low-energy frames per fragment."
+      }
+    ],
+    "session": [
+      {
+        "name": "reference_cache",
+        "type": "bool",
+        "required": false,
+        "default": true,
+        "description": "Reuse prepared conditioning for the most recent reference set."
+      },
+      {
+        "name": "parity",
+        "type": "enum",
+        "required": false,
+        "default": "reference",
+        "description": "Numerics profile: reference pins SDPA attention and the non-fused KDA recurrence.",
+        "values": [
+          "reference",
+          "fast"
+        ]
+      }
+    ],
+    "load": []
+  },
+  "package_defaults": {
+    "download": {
+      "kind": "huggingface_snapshot",
+      "repo": "jjmlovesgit/Ming-3.0-TTS-Tiny-GGUF",
+      "revision": "main",
+      "gated": false
+    }
+  },
+  "packages": [
+    {
+      "id": "ming_3_0_tts_tiny_q8_0",
+      "display_name": "Ming 3.0 TTS Tiny Q8_0",
+      "format": "gguf",
+      "precision": "q8_0",
+      "default": true,
+      "target_directory": "Ming-3.0-TTS-Tiny-GGUF",
+      "files": [
+        "ming-3.0-tts-tiny-q8_0.gguf"
+      ]
+    },
+    {
+      "id": "ming_3_0_tts_tiny_bf16",
+      "display_name": "Ming 3.0 TTS Tiny BF16",
+      "format": "gguf",
+      "precision": "bf16",
+      "default": false,
+      "target_directory": "Ming-3.0-TTS-Tiny-GGUF",
+      "files": [
+        "ming-3.0-tts-tiny-bf16.gguf"
+      ]
+    }
+  ],
+  "dependencies": [],
+  "ui": {
+    "recommended_package": "ming_3_0_tts_tiny_q8_0",
+    "tags": [
+      "TTS",
+      "GGUF"
+    ],
+    "docs": [
+      "docs/models/ming3_tts_tiny.md"
+    ]
+  },
+  "sources": [
+    {
+      "format": "gguf",
+      "roots": {
+        "model": ".",
+        "weights": "$gguf"
+      },
+      "files": {
+        "config": "model:config.json",
+        "generation_config": "model:generation_config.json",
+        "tokenizer_json": "model:tokenizer.json",
+        "tokenizer_config": "model:tokenizer_config.json",
+        "special_tokens_map": "model:special_tokens_map.json",
+        "chat_template": "model:chat_template.jinja"
+      },
+      "tensors": {
+        "weights": "weights:"
+      }
+    }
+  ]
+}

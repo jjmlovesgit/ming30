@@ -308,8 +308,9 @@ def main() -> int:
         running += len(blob)
     offsets.append(running)
     writer.add_array("audiocpp.embedded_files.names", file_names)
+    # the loader requires UINT64 offsets (tensor_source.cpp validates the array type)
     writer.add_key_value("audiocpp.embedded_files.offsets", offsets,
-                         gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.INT64)
+                         gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.UINT64)
     writer.add_array("audiocpp.embedded_files.data", b"".join(file_blobs))
     print(f"  embedded files  : {len(file_names)} totaling {total/1e6:.1f} MB "
           f"(tokenizer.json {'included' if 'tokenizer.json' in file_names else 'MISSING'})")
