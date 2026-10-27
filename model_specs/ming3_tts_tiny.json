@@ -167,7 +167,8 @@
         "type": "int",
         "required": false,
         "min": 1,
-        "description": "Maximum generated acoustic patches per fragment."
+        "description": "Duration cap: maximum generated acoustic patches. Mirrors the checkpoint's maximum_decode_steps (default 250 patches = 20.0 s at 12.5 patches/s). The checkpoint has no end-of-sentence decision (old_shift decode), so this is the only length control; shorter renders are explicit caps.",
+        "default": 250
       },
       {
         "name": "guidance_scale",
