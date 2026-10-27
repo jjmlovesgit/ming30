@@ -4,6 +4,10 @@
 #include "engine/models/ming3_tts_tiny/prompt.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -80,8 +84,9 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
     } else {
         std::printf("  expert bank     : MISSING\n");
     }
-    // Stage A: reproduce the reference prompt token ids (see
-    // out/reference/stage-a-segments.json) before any model maths is attempted.
+    // Stage A: prompt ids. Stage B dump (opt-in): the embedding for the same prompt.
+    // The embedding is the first capture point because it needs no model maths -- a
+    // mismatch there is tokenizer or weight loading, not attention.
     try {
         tokenizers::LlamaBpeTokenizerSpec spec{{}, {}, assets->resources.require_file("tokenizer_config"),
             assets->resources.require_file("tokenizer_json"),
@@ -103,6 +108,36 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
             std::printf("%s%d", index ? "," : "", prompt.ids[index]);
         }
         std::printf("\n");
+
+        if (const char * dump_dir = std::getenv("MING3_TINY_DUMP_DIR"); dump_dir != nullptr && *dump_dir != '\0') {
+            const std::vector<int64_t> shape{assets->config.vocabulary_size, assets->config.hidden_size};
+            const auto tensor = assets->weights->require_tensor("model.word_embeddings.weight",
+                engine::assets::TensorStorageType::BF16, shape);
+            const auto * raw = reinterpret_cast<const uint16_t *>(tensor.bytes.data());
+            const size_t hidden = static_cast<size_t>(assets->config.hidden_size);
+            std::vector<float> values(prompt.ids.size() * hidden);
+            for (size_t row = 0; row < prompt.ids.size(); ++row) {
+                const size_t source_row = static_cast<size_t>(prompt.ids[row]);
+                for (size_t column = 0; column < hidden; ++column) {
+                    const uint32_t bits = static_cast<uint32_t>(raw[source_row * hidden + column]) << 16;
+                    std::memcpy(&values[row * hidden + column], &bits, sizeof(float));
+                }
+            }
+            const std::filesystem::path out{dump_dir};
+            std::filesystem::create_directories(out);
+            std::ofstream(out / "embedding.bin", std::ios::binary)
+                .write(reinterpret_cast<const char *>(values.data()),
+                    static_cast<std::streamsize>(values.size() * sizeof(float)));
+            std::ofstream manifest(out / "manifest.json");
+            manifest << "{\n  \"stage\": \"B_thinker\",\n  \"prompt_ids\": [";
+            for (size_t index = 0; index < prompt.ids.size(); ++index) {
+                manifest << (index ? "," : "") << prompt.ids[index];
+            }
+            manifest << "],\n  \"captures\": [{\"name\": \"embedding\", \"shape\": [1, "
+                     << prompt.ids.size() << ", " << hidden
+                     << "], \"dtype\": \"float32\", \"file\": \"embedding.bin\"}]\n}\n";
+            std::printf("  stage B dump    : %s (embedding %zu x %zu)\n", dump_dir, prompt.ids.size(), hidden);
+        }
     } catch (const std::exception & error) {
         std::printf("  prompt stage A  : FAILED: %s\n", error.what());
     }
