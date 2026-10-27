@@ -41,7 +41,16 @@ struct RawTensor {
     Shape shape;
 };
 
+// Load a tensor in its *stored* dtype. The package keeps A_log, dt_bias and the MoE
+// expert_bias in F32; requesting BF16 for them silently rounds the gate and the router
+// bias, which is enough to move routing cutoffs.
 std::vector<float> load_float(const assets::TensorSource & source, const std::string & name, const Shape & shape) {
+    const auto meta = source.require_metadata(name);
+    if (meta.dtype == "F32" || meta.dtype == "f32") {
+        const auto tensor = source.require_tensor(name, assets::TensorStorageType::F32, shape);
+        const auto * raw = reinterpret_cast<const float *>(tensor.bytes.data());
+        return std::vector<float>(raw, raw + tensor.bytes.size() / sizeof(float));
+    }
     const auto tensor = source.require_tensor(name, assets::TensorStorageType::BF16, shape);
     const auto * raw = reinterpret_cast<const uint16_t *>(tensor.bytes.data());
     std::vector<float> values(tensor.bytes.size() / sizeof(uint16_t));
@@ -107,6 +116,16 @@ void short_conv_silu(const std::vector<float> & input, const std::vector<float> 
 
 std::string layer_prefix(size_t layer) { return "model.layers." + std::to_string(layer) + "."; }
 
+struct KdaTrace {
+    bool enabled = false;
+    std::vector<float> q_conv, k_conv, v_conv;   // after short conv + SiLU
+    std::vector<float> q_norm, k_norm;           // after per-head L2 normalisation
+    std::vector<float> gate;                     // lower-bounded gate, log space
+    std::vector<float> beta;                     // per head
+    std::vector<float> heads;                    // q^T S before the gated norm
+    std::vector<float> attn;                     // after gated norm + o_proj
+};
+
 struct Routing {
     std::vector<int32_t> ids;    // [tokens * kTopK], ordered by weight
     std::vector<float> weights;  // [tokens * kTopK]
@@ -115,7 +134,7 @@ struct Routing {
 // KDA attention for one layer: float32 recurrence. The reference uses FLA's chunk
 // path; the two agree to float32 precision on these inputs.
 void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<float> & input, size_t tokens,
-    std::vector<float> & output, std::vector<float> & attn_only) {
+    std::vector<float> & output, std::vector<float> & attn_only, KdaTrace * trace = nullptr) {
     const auto & source = *assets.weights;
     const size_t hidden = static_cast<size_t>(assets.config.hidden_size);
     const std::string prefix = layer_prefix(layer);
@@ -154,6 +173,11 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
     short_conv_silu(q_all, q_c, tokens, kProjection, 4, q_conv);
     short_conv_silu(k_all, k_c, tokens, kProjection, 4, k_conv);
     short_conv_silu(v_all, v_c, tokens, kProjection, 4, v_conv);
+    if (trace != nullptr && trace->enabled) {
+        trace->q_conv = q_conv;
+        trace->k_conv = k_conv;
+        trace->v_conv = v_conv;
+    }
 
     for (size_t time = 0; time < tokens; ++time) {
         for (size_t head = 0; head < kHeads; ++head) {
@@ -166,6 +190,15 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
                 for (size_t dim = 0; dim < kHeadDim; ++dim) base[dim] /= denom;
             }
         }
+    }
+
+    if (trace != nullptr && trace->enabled) {
+        trace->q_norm = q_conv;
+        trace->k_norm = k_conv;
+        trace->beta.assign(tokens * kHeads, 0.0f);
+        trace->gate.assign(tokens * kProjection, 0.0f);
+        trace->heads.assign(tokens * kProjection, 0.0f);
+        trace->attn.assign(tokens * hidden, 0.0f);
     }
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
@@ -184,6 +217,12 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
             for (size_t dim = 0; dim < kHeadDim; ++dim) {
                 const size_t index = head * kHeadDim + dim;
                 g[index] = kLowerBound * sigmoid(a * (f[index] + dt_bias[index]));
+            }
+            if (trace != nullptr && trace->enabled) {
+                trace->beta[time * kHeads + head] = beta;
+                for (size_t dim = 0; dim < kHeadDim; ++dim) {
+                    trace->gate[time * kProjection + head * kHeadDim + dim] = g[head * kHeadDim + dim];
+                }
             }
             float * s = state.data() + head * kHeadDim * kHeadDim;
             for (size_t row = 0; row < kHeadDim; ++row) {
@@ -207,6 +246,9 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
                 float sum = 0.0f;
                 for (size_t row = 0; row < kHeadDim; ++row) sum += scale * q_t[head * kHeadDim + row] * s[row * kHeadDim + column];
                 output_all[time * kProjection + head * kHeadDim + column] = sum;
+                if (trace != nullptr && trace->enabled) {
+                    trace->heads[time * kProjection + head * kHeadDim + column] = sum;
+                }
             }
         }
     }
@@ -224,6 +266,9 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
             }
         }
         linear(gated.data(), o_w.data(), kProjection, hidden, attn.data());
+        if (trace != nullptr && trace->enabled) {
+            for (size_t column = 0; column < hidden; ++column) trace->attn[time * hidden + column] = attn[column];
+        }
         for (size_t column = 0; column < hidden; ++column) {
             attn_only[time * hidden + column] = attn[column];
             fused[time * hidden + column] = input[time * hidden + column] + attn[column];
@@ -235,7 +280,7 @@ void run_kda(const MingTinyAssets & assets, size_t layer, const std::vector<floa
 // MLA attention: LoRA q/kv projections, interleaved RoPE on the 64-dim slice, causal
 // SDPA, head-wise sigmoid output gate, then the dense projection.
 void run_mla(const MingTinyAssets & assets, size_t layer, const std::vector<float> & input, size_t tokens,
-    std::vector<float> & output, std::vector<float> & attn_only) {
+    std::vector<float> & output, std::vector<float> & attn_only, KdaTrace * trace = nullptr) {
     const auto & source = *assets.weights;
     const size_t hidden = static_cast<size_t>(assets.config.hidden_size);
     const size_t heads = kHeads;
@@ -558,7 +603,7 @@ void dump_thinker_probe(const MingTinyAssets & assets, const std::vector<int32_t
     // Seeded mode: start from a captured hidden state instead of the embedding, so a
     // later layer can be judged independently of error inherited from earlier layers.
     size_t first_layer = 0;
-    const size_t limit = layers;  // all 24: 18 KDA + 6 MLA
+    size_t limit = layers;  // all 24: 18 KDA + 6 MLA
     if (const char * seed_path = std::getenv("MING3_TINY_SEED_STATE");
         seed_path != nullptr && *seed_path != '\0') {
         std::ifstream in(seed_path, std::ios::binary);
@@ -566,15 +611,35 @@ void dump_thinker_probe(const MingTinyAssets & assets, const std::vector<int32_t
         in.read(reinterpret_cast<char *>(state.data()), static_cast<std::streamsize>(state.size() * sizeof(float)));
         const char * layer_env = std::getenv("MING3_TINY_SEED_LAYER");
         first_layer = layer_env != nullptr ? static_cast<size_t>(std::atoi(layer_env)) : 3;
+        if (first_layer < limit) limit = std::min(limit, first_layer + 1);  // one layer from a seed
         std::printf("  stage B seed    : %s -> starting at layer %zu\n", seed_path, first_layer);
     }
 
     for (size_t layer = first_layer; layer < limit; ++layer) {
         std::vector<float> after_attention, attention_only;
+        KdaTrace trace;
+        if (const char * trace_env = std::getenv("MING3_TINY_TRACE_LAYER");
+            trace_env != nullptr && *trace_env != '\0' && static_cast<size_t>(std::atoi(trace_env)) == layer) {
+            trace.enabled = true;
+        }
         if (layer % 4 == 3) {
             run_mla(assets, layer, state, tokens, after_attention, attention_only);
         } else {
-            run_kda(assets, layer, state, tokens, after_attention, attention_only);
+            run_kda(assets, layer, state, tokens, after_attention, attention_only, &trace);
+            if (trace.enabled) {
+                const std::string tag = "trace_" + std::to_string(layer);
+                const Shape flat{1, static_cast<int64_t>(tokens), static_cast<int64_t>(kProjection)};
+                writer.add(tag + "_q_conv", trace.q_conv, flat);
+                writer.add(tag + "_k_conv", trace.k_conv, flat);
+                writer.add(tag + "_v_conv", trace.v_conv, flat);
+                writer.add(tag + "_q_norm", trace.q_norm, flat);
+                writer.add(tag + "_k_norm", trace.k_norm, flat);
+                writer.add(tag + "_gate", trace.gate, flat);
+                writer.add(tag + "_beta", trace.beta, {1, static_cast<int64_t>(tokens), static_cast<int64_t>(kHeads)});
+                writer.add(tag + "_heads", trace.heads, flat);
+                writer.add(tag + "_attn", trace.attn,
+                    {1, static_cast<int64_t>(tokens), static_cast<int64_t>(hidden)});
+            }
         }
         writer.add("attn_out_layer_" + std::to_string(layer), attention_only,
             {1, static_cast<int64_t>(tokens), static_cast<int64_t>(hidden)});

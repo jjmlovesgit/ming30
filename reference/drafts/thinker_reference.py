@@ -154,7 +154,7 @@ def load_naive_chunk_kda():
 
 
 def kda_layer(hidden: torch.Tensor, store: "WeightStore", cfg: dict, layer: int,
-              chunk_size: int = 64) -> torch.Tensor:
+              chunk_size: int = 64, trace: dict | None = None) -> torch.Tensor:
     """One KDA attention block, following modeling_bailing_moe_v3.
 
     q/k/v -> silu short conv -> l2norm(q,k) -> gate -> chunked KDA -> gated RMS norm -> o_proj
@@ -177,6 +177,10 @@ def kda_layer(hidden: torch.Tensor, store: "WeightStore", cfg: dict, layer: int,
     k = short_conv1d(F.linear(hidden, store.get(prefix + "k_proj.weight")), store.get(prefix + "k_conv1d.weight"))
     v = short_conv1d(F.linear(hidden, store.get(prefix + "v_proj.weight")), store.get(prefix + "v_conv1d.weight"))
     q, k, v = torch.nn.functional.silu(q), torch.nn.functional.silu(k), torch.nn.functional.silu(v)
+    if trace is not None:
+        trace["q_conv"] = q.clone()
+        trace["k_conv"] = k.clone()
+        trace["v_conv"] = v.clone()
 
     q = l2norm(q.view(1, total, heads, head_dim))
     k = l2norm(k.view(1, total, heads, head_dim))
@@ -185,13 +189,22 @@ def kda_layer(hidden: torch.Tensor, store: "WeightStore", cfg: dict, layer: int,
     raw_g = F.linear(hidden, store.get(prefix + "f_proj.weight")).view(1, total, heads, head_dim)
     g = kda_gate(raw_g, store.get(prefix + "A_log"), store.get(prefix + "dt_bias"), cfg["kda_lower_bound"])
     beta = torch.sigmoid(F.linear(hidden, store.get(prefix + "b_proj.weight"))).view(1, total, heads)
+    if trace is not None:
+        trace["q_norm"] = q.clone()
+        trace["k_norm"] = k.clone()
+        trace["gate"] = g.clone()
+        trace["beta"] = beta.clone()
 
     naive_chunk_kda, _ = load_naive_chunk_kda()
     o, _state = naive_chunk_kda(q, k, v, g, beta, chunk_size=chunk_size)
+    if trace is not None:
+        trace["heads"] = o.clone()
 
     gate_out = F.linear(hidden, store.get(prefix + "g_proj.weight")).view(1, total, heads, head_dim)
     o = gated_rms_norm(o, store.get(prefix + "o_norm.weight"), gate_out, eps)
     o = F.linear(o.reshape(1, total, heads * head_dim), store.get(prefix + "o_proj.weight"))
+    if trace is not None:
+        trace["attn"] = o[:, :tokens].clone()
     return o[:, :tokens]
 
 
