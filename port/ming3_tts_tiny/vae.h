@@ -7,11 +7,10 @@
 
 namespace engine::models::ming3_tts_tiny {
 
-// VAE decoder probe: one latent patch -> 3528 samples (80 ms at 44.1 kHz).
-// Captures after fc1, after upsampling, after the Qwen2 decoder, the iSTFT spectrum,
-// and the final waveform, so a parity mismatch is localised to the transformer or to
-// waveform reconstruction.
-void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & latent,
+// VAE decoder probe: `frames` latent patches -> frames * 4 * 882 samples.
+// Attention is full causal across all decoder tokens, matching the Python SDPA run;
+// the checkpoint's 64-token sliding window is a separate compatibility question.
+void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & latent, size_t frames,
     const std::filesystem::path & directory);
 
 }  // namespace engine::models::ming3_tts_tiny

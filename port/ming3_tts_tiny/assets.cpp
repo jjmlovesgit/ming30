@@ -143,14 +143,19 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
             dump_flow_probe(*assets, request, std::filesystem::path{flow_dir != nullptr ? flow_dir : "flow-dump"});
         }
 
-        // Stage D: decode a latent patch through the VAE decoder.
+        // Stage D: decode latent patches through the VAE decoder. The frame count is
+        // inferred from the file size (64 floats per patch).
         if (const char * latent_path = std::getenv("MING3_TINY_VAE_LATENT"); latent_path != nullptr && *latent_path != '\0') {
-            std::vector<float> latent(64);
-            std::ifstream in(latent_path, std::ios::binary);
+            std::ifstream in(latent_path, std::ios::binary | std::ios::ate);
             if (!in) throw std::runtime_error(std::string("cannot open ") + latent_path);
-            in.read(reinterpret_cast<char *>(latent.data()), static_cast<std::streamsize>(latent.size() * sizeof(float)));
+            const auto bytes = static_cast<size_t>(in.tellg());
+            in.seekg(0);
+            if (bytes % (64 * sizeof(float)) != 0) throw std::runtime_error("latent file is not a whole number of 64-float patches");
+            std::vector<float> latent(bytes / sizeof(float));
+            in.read(reinterpret_cast<char *>(latent.data()), static_cast<std::streamsize>(bytes));
+            const size_t frames = latent.size() / 64;
             const char * vae_dir = std::getenv("MING3_TINY_VAE_DUMP_DIR");
-            dump_vae_probe(*assets, latent, std::filesystem::path{vae_dir != nullptr ? vae_dir : "vae-dump"});
+            dump_vae_probe(*assets, latent, frames, std::filesystem::path{vae_dir != nullptr ? vae_dir : "vae-dump"});
         }
     } catch (const std::exception & error) {
         std::printf("  prompt stage A  : FAILED: %s\n", error.what());

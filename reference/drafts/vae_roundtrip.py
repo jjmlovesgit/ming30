@@ -67,6 +67,9 @@ def main() -> int:
     dec_backbone = dict(audio_cfg["dec_kwargs"]["backbone"])
     dec_backbone.setdefault("attention_bias", True)
     dec_backbone["_attn_implementation"] = "sdpa"
+    # Parity experiment: force full causal attention so it matches the C++ side.
+    # The released model runs flash-attention with sliding_window=64 instead.
+    dec_backbone["use_sliding_window"] = False
     decoder = qwen_from(dec_state, "audio.decoder.decoder.", dec_backbone)
 
     waveform = torch.from_numpy(np.load(args.wav)).float().reshape(1, -1)
@@ -125,7 +128,7 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.out / "roundtrip.npz", latent=latent.numpy(), waveform=restored,
                         original=original, decoder_hidden=hidden.numpy(),
-                        magnitude=magnitude.numpy())
+                        magnitude=magnitude.numpy(), fc1=d.numpy(), upsampled=up.numpy())
     print(f"input            : {original.size} samples ({original.size / 44100:.2f} s), rms {np.sqrt((original ** 2).mean()):.6f}")
     print(f"encoder frames   : {frames_total} -> {patches} patches")
     print(f"latent           : {tuple(latent.shape)} rms {float(latent.pow(2).mean().sqrt()):.5f} "

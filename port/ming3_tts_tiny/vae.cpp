@@ -4,6 +4,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -23,8 +24,7 @@ constexpr size_t kHeads = 14;
 constexpr size_t kKvHeads = 2;
 constexpr size_t kHeadDim = 64;
 constexpr size_t kMlp = 4864;
-constexpr size_t kPatch = 4;
-constexpr size_t kTokens = kPatch;          // one latent frame -> 4 decoder tokens
+constexpr size_t kPatch = 4;                // latent patch -> decoder tokens
 constexpr size_t kNBins = 1765;             // n_fft/2 + 1
 constexpr size_t kFft = 3528;
 constexpr size_t kHop = 882;
@@ -64,6 +64,8 @@ class VaeWeights {
 public:
     explicit VaeWeights(const assets::TensorSource & source) : source_(source) {}
 
+    [[nodiscard]] bool has(const std::string & name) const { return source_.has_tensor(name); }
+
     const std::vector<float> & tensor(const std::string & name, const Shape & shape) {
         const auto found = cache_.find(name);
         if (found != cache_.end()) return found->second;
@@ -82,9 +84,6 @@ public:
         return cache_.emplace(name, std::move(values)).first->second;
     }
 
-    [[nodiscard]] bool has(const std::string & name) const { return source_.has_tensor(name); }
-
-    // Qwen2 keeps bias on q/k/v but not on o_proj or the MLP projections.
     void linear_op(const float * x, const std::string & suffix, size_t in, size_t out, float * y) {
         const float * bias = has(suffix + ".bias")
             ? tensor(suffix + ".bias", {static_cast<int64_t>(out)}).data()
@@ -98,10 +97,12 @@ private:
     std::map<std::string, std::vector<float>> cache_;
 };
 
-// Qwen2-style rotary: halves convention, [cos, cos] layout.
-void rope_tables(float * cos_table, float * sin_table) {
+// Qwen2 rotary: halves convention, [cos, cos] layout.
+void rope_tables(size_t tokens, std::vector<float> & cos_table, std::vector<float> & sin_table) {
     const size_t half = kHeadDim / 2;
-    for (size_t position = 0; position < kTokens; ++position) {
+    cos_table.assign(tokens * kHeadDim, 0.0f);
+    sin_table.assign(tokens * kHeadDim, 0.0f);
+    for (size_t position = 0; position < tokens; ++position) {
         for (size_t index = 0; index < half; ++index) {
             const float freq = 1.0f / std::pow(kTheta, static_cast<float>(2 * index) / static_cast<float>(kHeadDim));
             const float angle = static_cast<float>(position) * freq;
@@ -151,59 +152,77 @@ void write_captures(const std::filesystem::path & directory, const std::vector<C
 
 }  // namespace
 
-void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & latent,
+void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & latent, size_t frames,
     const std::filesystem::path & directory) {
+    if (frames == 0 || latent.size() != frames * kLatent) {
+        throw std::runtime_error("VAE probe: latent size does not match frame count");
+    }
+    const size_t tokens = frames * kPatch;
     VaeWeights weights(*assets.weights);
     std::vector<Capture> captures;
 
-    // fc1: 64 -> 896
-    std::vector<float> x(kHidden);
-    weights.linear_op(latent.data(), prefix() + "fc1", kLatent, kHidden, x.data());
-    captures.push_back({"vae_fc1", {1, 1, static_cast<int64_t>(kHidden)}, x});
-
-    // linear upsample x4 (align_corners=False): 1 frame -> 4 frames
-    // A single input frame interpolated to 4 frames is that frame repeated: with one
-    // sample there is no second point to interpolate towards.
-    std::vector<float> up(kTokens * kHidden);
-    for (size_t token = 0; token < kTokens; ++token) {
-        std::memcpy(up.data() + token * kHidden, x.data(), kHidden * sizeof(float));
+    // fc1 per latent frame: 64 -> 896
+    std::vector<float> x(frames * kHidden);
+    for (size_t frame = 0; frame < frames; ++frame) {
+        weights.linear_op(latent.data() + frame * kLatent, prefix() + "fc1", kLatent, kHidden,
+            x.data() + frame * kHidden);
     }
-    captures.push_back({"vae_upsampled", {1, static_cast<int64_t>(kTokens), static_cast<int64_t>(kHidden)}, up});
+    captures.push_back({"vae_fc1", {1, static_cast<int64_t>(frames), static_cast<int64_t>(kHidden)}, x});
 
-    // decoder layers
-    float cos_table[kTokens * kHeadDim], sin_table[kTokens * kHeadDim];
-    rope_tables(cos_table, sin_table);
-    std::vector<float> normed(kHidden), q(kTokens * kHeads * kHeadDim), k(kTokens * kKvHeads * kHeadDim);
-    std::vector<float> v(kTokens * kKvHeads * kHeadDim), attn(kTokens * kHeads * kHeadDim);
-    std::vector<float> projected(kHidden), mlp_in(kMlp), mlp_out(kHidden), gate(kMlp), upv(kMlp);
-    std::vector<float> residual(kHidden);
+    // linear upsample x4 with align_corners=False: output i samples the input at
+    // pos = (i + 0.5)/4 - 0.5, clamped, interpolating between neighbouring frames.
+    // (A single frame collapses to replication, which is why the one-patch case passed.)
+    std::vector<float> up(tokens * kHidden);
+    for (size_t index = 0; index < tokens; ++index) {
+        const float position = (static_cast<float>(index) + 0.5f) / static_cast<float>(kPatch) - 0.5f;
+        const float clamped = std::min(std::max(position, 0.0f), static_cast<float>(frames) - 1.0f);
+        const size_t left = static_cast<size_t>(std::floor(clamped));
+        const size_t right = std::min(left + 1, frames - 1);
+        const float weight = clamped - static_cast<float>(left);
+        for (size_t column = 0; column < kHidden; ++column) {
+            up[index * kHidden + column] = (1.0f - weight) * x[left * kHidden + column] +
+                                           weight * x[right * kHidden + column];
+        }
+    }
+    captures.push_back({"vae_upsampled", {1, static_cast<int64_t>(tokens), static_cast<int64_t>(kHidden)}, up});
+
+    std::vector<float> cos_table, sin_table;
+    rope_tables(tokens, cos_table, sin_table);
+    std::vector<float> normed(kHidden);
+    std::vector<float> q(tokens * kHeads * kHeadDim), k(tokens * kKvHeads * kHeadDim);
+    std::vector<float> v(tokens * kKvHeads * kHeadDim), attn(tokens * kHeads * kHeadDim);
+    std::vector<float> projected(kHidden), gate(kMlp), upv(kMlp), mlp_out(kHidden);
     for (size_t layer = 0; layer < kLayers; ++layer) {
         const std::string block = prefix() + "decoder.layers." + std::to_string(layer) + ".";
-        for (size_t token = 0; token < kTokens; ++token) {
-            const float * input = up.data() + token * kHidden;
-            rms_norm(input, weights.tensor(block + "input_layernorm.weight", {static_cast<int64_t>(kHidden)}).data(),
-                kHidden, normed.data());
-            weights.linear_op(normed.data(), block + "self_attn.q_proj", kHidden, kHidden, q.data() + token * kHeads * kHeadDim);
+        const auto & layernorm = weights.tensor(block + "input_layernorm.weight", {static_cast<int64_t>(kHidden)});
+        const auto & post_norm = weights.tensor(block + "post_attention_layernorm.weight", {static_cast<int64_t>(kHidden)});
+        for (size_t token = 0; token < tokens; ++token) {
+            rms_norm(up.data() + token * kHidden, layernorm.data(), kHidden, normed.data());
+            weights.linear_op(normed.data(), block + "self_attn.q_proj", kHidden, kHeads * kHeadDim,
+                q.data() + token * kHeads * kHeadDim);
             weights.linear_op(normed.data(), block + "self_attn.k_proj", kHidden, kKvHeads * kHeadDim,
                 k.data() + token * kKvHeads * kHeadDim);
             weights.linear_op(normed.data(), block + "self_attn.v_proj", kHidden, kKvHeads * kHeadDim,
                 v.data() + token * kKvHeads * kHeadDim);
         }
-        for (size_t token = 0; token < kTokens; ++token) {
+        for (size_t token = 0; token < tokens; ++token) {
             for (size_t head = 0; head < kHeads; ++head) {
-                apply_rope(q.data() + token * kHeads * kHeadDim + head * kHeadDim, cos_table, sin_table, token);
+                apply_rope(q.data() + token * kHeads * kHeadDim + head * kHeadDim,
+                    cos_table.data(), sin_table.data(), token);
             }
             for (size_t head = 0; head < kKvHeads; ++head) {
-                apply_rope(k.data() + token * kKvHeads * kHeadDim + head * kHeadDim, cos_table, sin_table, token);
+                apply_rope(k.data() + token * kKvHeads * kHeadDim + head * kHeadDim,
+                    cos_table.data(), sin_table.data(), token);
             }
         }
+        // full causal attention across every token (matches the Python SDPA run)
         const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+        std::vector<float> scores(tokens);
         for (size_t head = 0; head < kHeads; ++head) {
             const size_t kv_head = head / (kHeads / kKvHeads);
-            for (size_t token = 0; token < kTokens; ++token) {
-                std::vector<float> scores(token + 1);
+            for (size_t token = 0; token < tokens; ++token) {
                 float best = -1e30f;
-                for (size_t key = 0; key <= token; ++key) {  // causal
+                for (size_t key = 0; key <= token; ++key) {
                     float sum = 0.0f;
                     for (size_t dim = 0; dim < kHeadDim; ++dim) {
                         sum += q[token * kHeads * kHeadDim + head * kHeadDim + dim] *
@@ -226,64 +245,63 @@ void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & la
                 }
             }
         }
-        for (size_t token = 0; token < kTokens; ++token) {
+        for (size_t token = 0; token < tokens; ++token) {
             weights.linear_op(attn.data() + token * kHeads * kHeadDim, block + "self_attn.o_proj",
                 kHeads * kHeadDim, kHidden, projected.data());
             for (size_t index = 0; index < kHidden; ++index) up[token * kHidden + index] += projected[index];
 
-            rms_norm(up.data() + token * kHidden,
-                weights.tensor(block + "post_attention_layernorm.weight", {static_cast<int64_t>(kHidden)}).data(),
-                kHidden, normed.data());
+            rms_norm(up.data() + token * kHidden, post_norm.data(), kHidden, normed.data());
             weights.linear_op(normed.data(), block + "mlp.gate_proj", kHidden, kMlp, gate.data());
             weights.linear_op(normed.data(), block + "mlp.up_proj", kHidden, kMlp, upv.data());
             for (size_t index = 0; index < kMlp; ++index) gate[index] = silu(gate[index]) * upv[index];
             weights.linear_op(gate.data(), block + "mlp.down_proj", kMlp, kHidden, mlp_out.data());
             for (size_t index = 0; index < kHidden; ++index) up[token * kHidden + index] += mlp_out[index];
         }
+        if (const char * trace_env = std::getenv("MING3_TINY_VAE_TRACE");
+            trace_env != nullptr && *trace_env != '\0') {
+            captures.push_back({"vae_layer_" + std::to_string(layer),
+                {1, static_cast<int64_t>(tokens), static_cast<int64_t>(kHidden)}, up});
+        }
     }
 
-    // final norm then head
-    std::vector<float> hidden(kTokens * kHidden);
-    for (size_t token = 0; token < kTokens; ++token) {
-        rms_norm(up.data() + token * kHidden,
-            weights.tensor(prefix() + "decoder.norm.weight", {static_cast<int64_t>(kHidden)}).data(),
-            kHidden, hidden.data() + token * kHidden);
+    std::vector<float> hidden(tokens * kHidden);
+    const auto & final_norm = weights.tensor(prefix() + "decoder.norm.weight", {static_cast<int64_t>(kHidden)});
+    for (size_t token = 0; token < tokens; ++token) {
+        rms_norm(up.data() + token * kHidden, final_norm.data(), kHidden, hidden.data() + token * kHidden);
     }
-    captures.push_back({"vae_decoder_hidden", {1, static_cast<int64_t>(kTokens), static_cast<int64_t>(kHidden)}, hidden});
+    captures.push_back({"vae_decoder_hidden", {1, static_cast<int64_t>(tokens), static_cast<int64_t>(kHidden)}, hidden});
 
-    std::vector<float> head(kTokens * (kFft + 2));
-    for (size_t token = 0; token < kTokens; ++token) {
+    std::vector<float> head(tokens * (kFft + 2));
+    for (size_t token = 0; token < tokens; ++token) {
         weights.linear_op(hidden.data() + token * kHidden, prefix() + "head.out", kHidden, kFft + 2,
             head.data() + token * (kFft + 2));
     }
-    captures.push_back({"vae_head_out", {1, static_cast<int64_t>(kTokens), static_cast<int64_t>(kFft + 2)}, head});
+    captures.push_back({"vae_head_out", {1, static_cast<int64_t>(tokens), static_cast<int64_t>(kFft + 2)}, head});
 
-    // spectrum: mag = exp(clip), phase -> complex bins
-    std::vector<std::complex<double>> spectrum(kTokens * kNBins);
-    std::vector<float> magnitude(kTokens * kNBins), phase_capture(kTokens * kNBins);
-    for (size_t token = 0; token < kTokens; ++token) {
+    std::vector<std::complex<double>> spectrum(tokens * kNBins);
+    std::vector<float> magnitude(tokens * kNBins), phase_capture(tokens * kNBins);
+    for (size_t token = 0; token < tokens; ++token) {
         for (size_t bin = 0; bin < kNBins; ++bin) {
-            const float mag_raw = head[token * (kFft + 2) + bin];
+            const float mag = std::min(std::exp(head[token * (kFft + 2) + bin]), 100.0f);
             const float phase = head[token * (kFft + 2) + kNBins + bin];
-            const float mag = std::min(std::exp(mag_raw), 100.0f);
             magnitude[token * kNBins + bin] = mag;
             phase_capture[token * kNBins + bin] = phase;
             spectrum[token * kNBins + bin] = std::polar(static_cast<double>(mag), static_cast<double>(phase));
         }
     }
-    captures.push_back({"vae_magnitude", {1, static_cast<int64_t>(kTokens), static_cast<int64_t>(kNBins)}, magnitude});
-    captures.push_back({"vae_phase", {1, static_cast<int64_t>(kTokens), static_cast<int64_t>(kNBins)}, phase_capture});
+    captures.push_back({"vae_magnitude", {1, static_cast<int64_t>(tokens), static_cast<int64_t>(kNBins)}, magnitude});
+    captures.push_back({"vae_phase", {1, static_cast<int64_t>(tokens), static_cast<int64_t>(kNBins)}, phase_capture});
 
-    // iSTFT: naive irfft (n_fft 3528), window, overlap-add, trim, envelope
     const auto & window = weights.tensor(prefix() + "head.istft.window", {static_cast<int64_t>(kFft)});
-    std::vector<double> folded((kTokens - 1) * kHop + kFft, 0.0);
-    std::vector<double> envelope((kTokens - 1) * kHop + kFft, 0.0);
-    for (size_t token = 0; token < kTokens; ++token) {
-        std::vector<double> frame(kFft);
+    const size_t output_size = (tokens - 1) * kHop + kFft;
+    std::vector<double> folded(output_size, 0.0), envelope(output_size, 0.0);
+    std::vector<double> frame(kFft);
+    for (size_t token = 0; token < tokens; ++token) {
         for (size_t sample = 0; sample < kFft; ++sample) {
             double sum = spectrum[token * kNBins].real();
             for (size_t bin = 1; bin < kNBins - 1; ++bin) {
-                const double angle = 2.0 * 3.14159265358979323846 * static_cast<double>(bin) * static_cast<double>(sample) / static_cast<double>(kFft);
+                const double angle = 2.0 * 3.14159265358979323846 * static_cast<double>(bin) *
+                                      static_cast<double>(sample) / static_cast<double>(kFft);
                 const auto & value = spectrum[token * kNBins + bin];
                 sum += 2.0 * (value.real() * std::cos(angle) - value.imag() * std::sin(angle));
             }
@@ -293,18 +311,19 @@ void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & la
             envelope[token * kHop + sample] += static_cast<double>(window[sample]) * window[sample];
         }
     }
-    std::vector<float> waveform(kTokens * kHop);
+    std::vector<float> waveform(tokens * kHop);
     for (size_t index = 0; index < waveform.size(); ++index) {
         const size_t position = index + kPad;
         waveform[index] = static_cast<float>(folded[position] / envelope[position]);
     }
-    captures.push_back({"vae_waveform", {1, static_cast<int64_t>(kTokens * kHop)}, waveform});
+    captures.push_back({"vae_waveform", {1, static_cast<int64_t>(waveform.size())}, waveform});
 
     write_captures(directory, captures);
     double sum = 0.0;
     for (float value : waveform) sum += static_cast<double>(value) * value;
-    std::printf("  vae probe       : %zu captures, waveform %zu samples, rms=%.6f\n",
-        captures.size(), waveform.size(), std::sqrt(sum / static_cast<double>(waveform.size())));
+    std::printf("  vae probe       : %zu frames, %zu tokens, %zu captures, waveform %zu samples, rms=%.6f\n",
+        frames, tokens, captures.size(), waveform.size(),
+        std::sqrt(sum / static_cast<double>(waveform.size())));
 }
 
 }  // namespace engine::models::ming3_tts_tiny
