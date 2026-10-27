@@ -39,6 +39,68 @@ Note the attention is KDA on **every** layer — there are no MLA tensors in the
 checkpoint (`q_a_proj`/`kv_a_proj` absent), so a C++ implementation can ignore
 `BailingMoeV3MultiLatentAttention` for this model.
 
+
+## Findings from the FLA source (2026-10-26)
+
+Pulled `fla/ops/kda/{naive,gate,chunk}.py` and `fla/modules/norm/fused_norm_gate.py`.
+
+**Dispatch.** `chunk_kda(g_input, A_log, dt_bias, beta_raw, safe_gate, lower_bound,
+use_gate_in_kernel)`: the gate is computed *inside* the op when
+`use_gate_in_kernel=True`, and the output gate is applied separately by the caller's
+`FusedRMSNormGated`. `chunk_size = 64`, and `naive_chunk_kda` asserts
+`T % chunk_size == 0`, so a 41-token prompt must be padded to 64 (causal, so trailing
+padding cannot change real-position outputs).
+
+**Gate math** (this checkpoint: `kda_safe_gate=True`, `kda_lower_bound=-5.0`):
+
+```
+g = lower_bound * sigmoid(exp(A_log) * (raw_g + dt_bias))     # float32, per head
+```
+
+`A_log` is per head (16 values), `dt_bias` is per head-dim (2048 = 16x128). The
+non-safe variant would be `-exp(A_log) * softplus(g + dt_bias)`.
+
+**Layer pipeline** (from `BailingMoeV3KimiDeltaAttention.forward`):
+
+```
+q,k,v  = proj(h) -> ShortConvolution(k=4, causal, activation='silu')
+q,k    = l2norm over head_dim            (use_qk_norm=True)
+raw_g  = f_proj(h) -> kda gate above
+beta   = sigmoid(b_proj(h))              # per head
+o      = chunk_kda(q, k, v, g, beta)     # no separate scale: 1/sqrt(head_dim)
+o      = FusedRMSNormGated(head_dim, sigmoid)(o, g_proj(h))
+out    = o_proj(o)
+```
+
+Two distinct gates: `f_proj` drives the recurrence decay, `g_proj` drives the output
+norm (`y = rms_norm(x) * weight * sigmoid(gate)`). Both are present in the checkpoint.
+
+**Precision.** Everything inside `naive_*_kda` and `naive_kda_gate` is computed in
+float32 and cast back at the end.
+
+**The equivalence result.** FLA's own chunk path and its own recurrent path agree to
+`max|diff| = 5.9e-09` (relative `5.7e-07`) on random 64-token inputs in float32.
+
+That matters: it means the chunk and recurrent *algorithms* are the same recurrence,
+and upstream's warning describes the numerics of their fused CUDA **recurrent kernel**,
+not the mathematics. For our own implementations a float32 recurrence is a legitimate
+stand-in — but the reference we compare against stays `naive_chunk_kda` (the chunked
+path the released model runs), exactly as instructed.
+
+## Reference status
+
+`thinker_reference.py --kda` runs one full KDA layer on real weights:
+
+```
+kda_layer          shape=(1, 41, 1536) finite=True
+chunk vs recurrent max|diff|=5.937e-09 (signal max 0.010, relative 5.744e-07)
+kda smoke: PASS
+```
+
+Remaining for the reference: the dense MLP (layer 0), the MoE block (layers 1-23:
+shared expert + 8-of-128 with `expert_bias` and group-limited routing), the residual
+stream over 24 layers, final norm, and the stop head.
+
 ## What already runs (this is not a plan, it is executed)
 
 `reference/drafts/thinker_reference.py` loads the real shards and runs:
