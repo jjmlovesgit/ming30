@@ -4,6 +4,7 @@
 #include "engine/models/ming3_tts_tiny/prompt.h"
 #include "engine/models/ming3_tts_tiny/thinker.h"
 #include "engine/models/ming3_tts_tiny/flow.h"
+#include "engine/models/ming3_tts_tiny/vae.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -140,6 +141,16 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
             }
             const char * flow_dir = std::getenv("MING3_TINY_FLOW_DUMP_DIR");
             dump_flow_probe(*assets, request, std::filesystem::path{flow_dir != nullptr ? flow_dir : "flow-dump"});
+        }
+
+        // Stage D: decode a latent patch through the VAE decoder.
+        if (const char * latent_path = std::getenv("MING3_TINY_VAE_LATENT"); latent_path != nullptr && *latent_path != '\0') {
+            std::vector<float> latent(64);
+            std::ifstream in(latent_path, std::ios::binary);
+            if (!in) throw std::runtime_error(std::string("cannot open ") + latent_path);
+            in.read(reinterpret_cast<char *>(latent.data()), static_cast<std::streamsize>(latent.size() * sizeof(float)));
+            const char * vae_dir = std::getenv("MING3_TINY_VAE_DUMP_DIR");
+            dump_vae_probe(*assets, latent, std::filesystem::path{vae_dir != nullptr ? vae_dir : "vae-dump"});
         }
     } catch (const std::exception & error) {
         std::printf("  prompt stage A  : FAILED: %s\n", error.what());
