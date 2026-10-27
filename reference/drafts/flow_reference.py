@@ -152,7 +152,7 @@ def flow_sample(cond: torch.Tensor, noise: torch.Tensor, history: torch.Tensor, 
     t = epss_timesteps(steps)
     t = t + sway * (torch.cos(torch.pi / 2 * t) - 1 + t)
 
-    trajectory, velocities, velocities_pre, times = [y.clone()], [], [], []
+    trajectory, velocities, velocities_pre, velocities_null, times = [y.clone()], [], [], [], []
     capture_before = {}
     for t0, t1 in zip(t[:-1], t[1:]):
         if cfg == 1.0:
@@ -164,6 +164,7 @@ def flow_sample(cond: torch.Tensor, noise: torch.Tensor, history: torch.Tensor, 
             out = dit_forward(y2, t0.expand(2), both, h2, weights, capture_before)[:, -1:, :]
             pred, null_pred = torch.chunk(out, 2, dim=0)
             velocities_pre.append(pred.detach().numpy())
+            velocities_null.append(null_pred.detach().numpy())
             pred = pred + (pred - null_pred) * cfg
         dt = t1 - t0
         y = y + dt * pred
@@ -174,6 +175,7 @@ def flow_sample(cond: torch.Tensor, noise: torch.Tensor, history: torch.Tensor, 
         velocities.append(pred.detach().numpy())
         trajectory.append(y.clone())
     return {"times": times, "velocities": velocities, "velocities_pre_cfg": velocities_pre,
+            "velocities_null": velocities_null,
             "trajectory": trajectory, "latents": trajectory[-1].detach().numpy(),
             "cond_post": cond_post}
 
@@ -210,6 +212,8 @@ def main() -> int:
         arrays["cond_post_c_embedder"] = result["cond_post"]
     if result["velocities_pre_cfg"]:
         arrays["velocities_pre_cfg"] = np.concatenate(result["velocities_pre_cfg"], axis=0)
+    if result["velocities_null"]:
+        arrays["velocities_null"] = np.concatenate(result["velocities_null"], axis=0)
     np.savez_compressed(args.out / "flow-step.npz", **arrays)
     print(f"cond            : {tuple(cond.shape)} (last thinker position)")
     print(f"noise           : {tuple(noise.shape)} seed={args.seed}")

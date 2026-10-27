@@ -3,6 +3,7 @@
 #include "engine/framework/model_spec/package.h"
 #include "engine/models/ming3_tts_tiny/prompt.h"
 #include "engine/models/ming3_tts_tiny/thinker.h"
+#include "engine/models/ming3_tts_tiny/flow.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -114,6 +115,31 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
         if (const char * dump_dir = std::getenv("MING3_TINY_DUMP_DIR"); dump_dir != nullptr && *dump_dir != '\0') {
             dump_thinker_probe(*assets, prompt.ids, std::filesystem::path{dump_dir});
             std::printf("  stage B dump    : %s (embedding + layer_0)\n", dump_dir);
+        }
+
+        // Stage C: one flow step from a supplied condition and initial noise, so the
+        // same inputs can be fed to the Python reference.
+        if (const char * cond_path = std::getenv("MING3_TINY_FLOW_COND"); cond_path != nullptr && *cond_path != '\0') {
+            const auto read_floats = [](const char * path, size_t count) {
+                std::vector<float> values(count);
+                std::ifstream in(path, std::ios::binary);
+                if (!in) throw std::runtime_error(std::string("cannot open ") + path);
+                in.read(reinterpret_cast<char *>(values.data()), static_cast<std::streamsize>(count * sizeof(float)));
+                return values;
+            };
+            FlowRequest request;
+            request.cond = read_floats(cond_path, 1536);
+            const char * noise_path = std::getenv("MING3_TINY_FLOW_NOISE");
+            if (noise_path == nullptr) throw std::runtime_error("MING3_TINY_FLOW_NOISE is required with MING3_TINY_FLOW_COND");
+            request.noise = read_floats(noise_path, 64);
+            if (const char * cfg_env = std::getenv("MING3_TINY_FLOW_CFG"); cfg_env != nullptr) {
+                request.cfg = static_cast<float>(std::atof(cfg_env));
+            }
+            if (const char * steps_env = std::getenv("MING3_TINY_FLOW_STEPS"); steps_env != nullptr) {
+                request.steps = std::atoi(steps_env);
+            }
+            const char * flow_dir = std::getenv("MING3_TINY_FLOW_DUMP_DIR");
+            dump_flow_probe(*assets, request, std::filesystem::path{flow_dir != nullptr ? flow_dir : "flow-dump"});
         }
     } catch (const std::exception & error) {
         std::printf("  prompt stage A  : FAILED: %s\n", error.what());
