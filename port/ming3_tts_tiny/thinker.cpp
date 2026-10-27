@@ -5,7 +5,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cstdlib>
+#include <deque>
 #include <fstream>
+#include <map>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -44,23 +47,88 @@ struct RawTensor {
 // Load a tensor in its *stored* dtype. The package keeps A_log, dt_bias and the MoE
 // expert_bias in F32; requesting BF16 for them silently rounds the gate and the router
 // bias, which is enough to move routing cutoffs.
+// Resident weight cache. Decode steps need the same weights every step, and re-reading
+// plus converting them from the package dominates single-token latency. Bounded by a byte
+// budget with FIFO eviction so the process cannot grow without limit.
+struct WeightCache {
+    std::map<std::string, std::vector<float>> floats;
+    std::map<std::string, RawTensor> raws;
+    std::deque<std::string> order;
+    size_t bytes = 0;
+    size_t budget = static_cast<size_t>(16) << 30;
+
+    bool enabled() const {
+        const char * flag = std::getenv("MING3_TINY_WEIGHT_CACHE");
+        return flag == nullptr || *flag == '\0' || std::atoi(flag) != 0;
+    }
+
+    void evict() {
+        while (bytes > budget && !order.empty()) {
+            const std::string victim = order.front();
+            order.pop_front();
+            const auto raw = raws.find(victim);
+            if (raw != raws.end()) {
+                bytes -= raw->second.bytes.size();
+                raws.erase(raw);
+                continue;
+            }
+            const auto found = floats.find(victim);
+            if (found == floats.end()) continue;
+            bytes -= found->second.size() * sizeof(float);
+            floats.erase(found);
+        }
+    }
+};
+
+WeightCache & weight_cache() {
+    static WeightCache cache;
+    return cache;
+}
+
 std::vector<float> load_float(const assets::TensorSource & source, const std::string & name, const Shape & shape) {
+    auto & cache = weight_cache();
+    if (cache.enabled()) {
+        const auto found = cache.floats.find(name);
+        if (found != cache.floats.end()) return found->second;   // memcpy out, no conversion
+    }
     const auto meta = source.require_metadata(name);
+    std::vector<float> values;
     if (meta.dtype == "F32" || meta.dtype == "f32") {
         const auto tensor = source.require_tensor(name, assets::TensorStorageType::F32, shape);
         const auto * raw = reinterpret_cast<const float *>(tensor.bytes.data());
-        return std::vector<float>(raw, raw + tensor.bytes.size() / sizeof(float));
+        values.assign(raw, raw + tensor.bytes.size() / sizeof(float));
+    } else {
+        const auto tensor = source.require_tensor(name, assets::TensorStorageType::BF16, shape);
+        const auto * raw = reinterpret_cast<const uint16_t *>(tensor.bytes.data());
+        values.resize(tensor.bytes.size() / sizeof(uint16_t));
+        for (size_t index = 0; index < values.size(); ++index) values[index] = bf16_to_float(raw[index]);
     }
-    const auto tensor = source.require_tensor(name, assets::TensorStorageType::BF16, shape);
-    const auto * raw = reinterpret_cast<const uint16_t *>(tensor.bytes.data());
-    std::vector<float> values(tensor.bytes.size() / sizeof(uint16_t));
-    for (size_t index = 0; index < values.size(); ++index) values[index] = bf16_to_float(raw[index]);
+    if (cache.enabled()) {
+        cache.bytes += values.size() * sizeof(float);
+        cache.order.push_back(name);
+        cache.floats.emplace(name, values);
+        cache.evict();
+    }
     return values;
 }
 
+// Expert banks are the dominant read: three banks per MoE layer, ~200 MB each, needed
+// again on every decode step. Keep their bytes resident under the same budget.
 RawTensor load_raw(const assets::TensorSource & source, const std::string & name, const Shape & shape) {
+    auto & cache = weight_cache();
+    if (cache.enabled()) {
+        const auto found = cache.raws.find(name);
+        if (found != cache.raws.end()) return found->second;
+    }
     auto tensor = source.require_tensor(name, assets::TensorStorageType::BF16, shape);
-    return {std::move(tensor.bytes), std::move(shape)};
+    RawTensor value{std::move(tensor.bytes), shape};
+    if (cache.enabled()) {
+        cache.bytes += value.bytes.size();
+        cache.order.push_back(name);
+        cache.raws.emplace(name, value);
+        cache.evict();
+    }
+    return value;
 }
 
 // y[o] = sum_i x[i] * weight[o * in + i], i.e. nn.Linear without bias.

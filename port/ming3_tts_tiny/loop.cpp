@@ -280,16 +280,22 @@ void dump_loop_probe(const MingTinyAssets & assets, const std::vector<int32_t> &
     std::vector<float> latents_all;
     std::filesystem::create_directories(directory);
 
+    // Prefill the prompt once, then advance one projected latent per patch. This is the
+    // decode path: each patch costs a single-token step instead of a full recompute.
+    ThinkerCache cache;
+    thinker_prefill_cached(assets, embeds, prompt_ids.size(), cache, final_norm);
+
     for (size_t patch = 0; patch < patches; ++patch) {
-        const size_t tokens = embeds.size() / kHiddenLlm;
-        thinker_forward_embeds(assets, embeds, tokens, final_norm);
+        const size_t tokens = prompt_ids.size() + patch;
+        if (patch > 0) {
+            thinker_step_cached(assets, feedback, cache, final_norm);
+        }
         std::vector<float> cond(final_norm.end() - kHiddenLlm, final_norm.end());
         std::vector<float> noise(noises.begin() + patch * kLatent, noises.begin() + (patch + 1) * kLatent);
         latent = flow_sample_from_noise(assets, cond, noise, history, cfg, flow_steps);
         aggregator(latent.data(), feedback.data());
 
         latents_all.insert(latents_all.end(), latent.begin(), latent.end());
-        embeds.insert(embeds.end(), feedback.begin(), feedback.end());
         history = latent;
 
         std::ofstream(directory / ("latent_" + std::to_string(patch) + ".bin"), std::ios::binary)

@@ -28,23 +28,30 @@ recurrence order, and MLA attention over the same keys in the same order. Any di
 would have indicated a state bug; there is none. KDA recurrent state, KDA convolution
 history and MLA key/value state are all being carried correctly.
 
-## The surprise: caching alone is a pessimisation
+## Correction: the cache is faster for the same task
 
-| path | time | per token |
+The first version of this note compared 27.9 s for a 58-token full pass against 76.1 s for
+17 cached steps and called caching a pessimisation. That comparison was wrong: the two runs
+do not produce the same amount of work.
+
+- the full pass produces **one** result, the hidden state at token 58;
+- the cached run produces **seventeen** successive results (tokens 42 through 58).
+
+For the token-58 result alone, one warm cached step costs **4.48 s** versus **27.9 s** to
+recompute 58 tokens — about **6x faster**, and the gap widens with sequence length because
+the cached step is O(1) in the number of prior tokens.
+
+What the 4.48 s/step vs 0.48 s/token figure actually measures is **lost batching
+efficiency**: in a full pass, one weight load feeds 58 tokens; in a one-token call it feeds
+one. That is a real cost, but it is not an argument against caching — it is an argument for
+keeping weights resident.
+
+| measurement | value | what it means |
 |---|---|---|
-| full recompute, 58 tokens | 27.9 s | 0.48 s |
-| prefill, 41 tokens | 19.4 s | 0.47 s |
-| cached steps, 17 × 1 token | 76.1 s | **4.48 s** |
-
-A single-token step costs ~9x more than a token inside a fresh pass. The reason is that
-every step reloads and converts all layer weights from the package; in a full pass that
-cost is amortised over the whole sequence. So the KV cache removes redundant *arithmetic*
-but not redundant *I/O*, and I/O dominates at one token per call.
-
-Implication for the speed work: **weight caching (and/or keeping weights resident on the
-GPU) is the real lever**, not the KV cache by itself. The KV cache is nevertheless
-required for practical decode, because it makes each step O(1) in sequence length; it just
-has to be paired with resident weights to pay off.
+| full recompute, 58 tokens | 27.9 s | cost of producing the token-58 state by recomputation |
+| one warm cached step | 4.48 s | cost of producing the same state incrementally |
+| 17 cached steps | 76.1 s | 17 states, i.e. 4.48 s each |
+| 0.48 s/token in a batch | — | batching efficiency, not the decode cost |
 
 ## Status against the plan
 
