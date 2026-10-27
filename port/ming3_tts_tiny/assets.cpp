@@ -23,6 +23,7 @@ MingTinyConfig parse_config(const io::json::Value & value) {
     config.experts_per_token = llm.require("num_experts_per_tok").as_i64();
     config.hidden_size = llm.require("hidden_size").as_i64();
     config.vocabulary_size = llm.require("vocab_size").as_i64();
+    config.first_k_dense_replace = llm.require("first_k_dense_replace").as_i64();
     const auto & flow = value.require("flow_config");
     config.flow_depth = flow.require("depth").as_i64();
     config.flow_hidden_size = flow.require("hidden_size").as_i64();

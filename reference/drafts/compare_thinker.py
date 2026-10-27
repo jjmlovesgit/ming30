@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -40,8 +41,23 @@ def load_cpp_dump(root: Path) -> dict:
     captures = {}
     for entry in manifest.get("captures", []):
         path = root / entry["file"]
-        data = np.fromfile(path, dtype="<f4")
+        dtype = "<i4" if entry.get("dtype") == "int32" else "<f4"
+        data = np.fromfile(path, dtype=dtype)
         captures[entry["name"]] = data.reshape(entry["shape"])
+
+    def order(name: str):
+        # embedding first, then per layer: routing ids, routing weights, hidden
+        if name == "embedding":
+            return (0, 0, 0)
+        match = re.match(r"routing_layer_(\d+)_(ids|weights)$", name)
+        if match:
+            return (1, int(match[1]), 0 if match[2] == "ids" else 1)
+        match = re.match(r"layer_(\d+)$", name)
+        if match:
+            return (1, int(match[1]), 2)
+        return (2, 0, 0)
+
+    captures = dict(sorted(captures.items(), key=lambda item: order(item[0])))
     return {"manifest": manifest, "captures": captures}
 
 
@@ -89,6 +105,19 @@ def main() -> int:
     for name in names:
         if name not in ref_npz:
             print(f"{name:<14} reference has no such capture")
+            continue
+        if cpp_captures[name].dtype.kind == "i":
+            reference_ids = ref_npz[name].astype(np.int64)
+            actual_ids = cpp_captures[name].astype(np.int64)
+            mismatches = int((reference_ids != actual_ids).any(axis=-1).sum())
+            total = int(reference_ids.shape[0])
+            status = "PASS" if mismatches == 0 else "FAIL"
+            print(f"{status:<5} {name:<24} token rows matching={total - mismatches}/{total}")
+            if mismatches and status == "FAIL" and first_failure is None:
+                first_failure = name
+                bad = int(np.argmax((reference_ids != actual_ids).any(axis=-1)))
+                print(f"      first differing token {bad}: reference {reference_ids[bad].tolist()} "
+                      f"vs cpp {actual_ids[bad].tolist()}")
             continue
         threshold = THRESHOLDS.get(name, THRESHOLDS["default"])
         row = compare(name, ref_npz[name], cpp_captures[name], threshold)

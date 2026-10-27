@@ -16,6 +16,7 @@ struct MingTinyConfig {
     int64_t experts_per_token = 0;
     int64_t hidden_size = 0;
     int64_t vocabulary_size = 0;
+    int64_t first_k_dense_replace = 1;
     int64_t flow_depth = 0;
     int64_t flow_hidden_size = 0;
     int64_t sample_rate = 0;

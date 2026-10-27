@@ -318,7 +318,7 @@ def moe_forward(hidden: torch.Tensor, store: "WeightStore", cfg: dict, layer: in
             y[mask] += contribution * weight[mask].unsqueeze(-1)
 
     y = y + mlp_forward(x, store, prefix + ".shared_experts")
-    return y.view_as(hidden), logits, top_idx
+    return y.view_as(hidden), logits, top_idx, weights
 
 
 def run_thinker(model: Path, text: str, prompt_ids: list[int], out_dir: Path) -> int:
@@ -350,10 +350,11 @@ def run_thinker(model: Path, text: str, prompt_ids: list[int], out_dir: Path) ->
         if layer < cfg["first_k_dense_replace"]:
             block = mlp_forward(normed, store, prefix + "mlp")
         else:
-            block, logits, top_idx = moe_forward(normed, store, cfg, layer)
+            block, logits, top_idx, top_weights = moe_forward(normed, store, cfg, layer)
             router_captures[layer] = {
                 "logits": logits.detach().numpy(),
                 "top_idx": top_idx.detach().numpy(),
+                "weights": top_weights.detach().numpy(),
             }
         hidden = residual + block
         captures[f"layer_{layer}"] = hidden.clone()
@@ -363,6 +364,9 @@ def run_thinker(model: Path, text: str, prompt_ids: list[int], out_dir: Path) ->
 
     out_dir.mkdir(parents=True, exist_ok=True)
     arrays = {name: tensor.detach().float().numpy() for name, tensor in captures.items()}
+    for layer, info in router_captures.items():
+        arrays[f"routing_layer_{layer}_ids"] = info["top_idx"].astype("int32")
+        arrays[f"routing_layer_{layer}_weights"] = info["weights"].astype("float32")
     arrays["final_norm"] = final.detach().float().numpy()
     arrays["stop_logits"] = stop_logits.detach().float().numpy()
     np.savez_compressed(out_dir / "thinker-41.npz", **arrays)
@@ -385,7 +389,13 @@ def run_thinker(model: Path, text: str, prompt_ids: list[int], out_dir: Path) ->
             name: {"mean": float(t.mean()), "std": float(t.std()), "l2": float(t.norm())}
             for name, t in captures.items() if name.startswith("layer_")
         },
-        "router_layers": {str(k): {"top_idx_first_token": v["top_idx"][0].tolist()} for k, v in router_captures.items()},
+        "router_layers": {
+            str(k): {
+                "ids_first_token": v["top_idx"][0].tolist(),
+                "weights_first_token": [round(float(w), 5) for w in v["weights"][0].tolist()],
+            }
+            for k, v in router_captures.items()
+        },
         "stop_logits": stop_logits.detach().numpy().tolist(),
         "stop_decision": int(torch.argmax(stop_logits, dim=-1).item()),
     }
