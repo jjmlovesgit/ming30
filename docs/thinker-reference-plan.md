@@ -35,9 +35,13 @@ Config: 24 layers, hidden 1536, **16 heads**, head_dim 128, v_head_dim 128,
 128 experts, top-8, `n_group=8`, `topk_group=4`, `routed_scaling_factor=2.5`,
 `rms_norm_eps=1e-6`, rope_theta 10000.
 
-Note the attention is KDA on **every** layer — there are no MLA tensors in the
-checkpoint (`q_a_proj`/`kv_a_proj` absent), so a C++ implementation can ignore
-`BailingMoeV3MultiLatentAttention` for this model.
+**Correction (2026-10-26):** the attention is hybrid, not uniform. Layers
+3, 7, 11, 15, 19, 23 are **MLA** (`q_a_proj`, `q_a_layernorm`, `q_b_proj`,
+`kv_a_proj_with_mqa`, `kv_a_layernorm`, `kv_b_proj`, `g_proj`, `dense`); the other 18
+layers are KDA. An earlier revision of this document claimed KDA on every layer;
+that was wrong and is corrected here. MLA dims: q_lora_rank 256, kv_lora_rank 512,
+qk_nope 128, qk_rope 64, v_head 128, `rope_interleave=True`, head-wise output gate.
+So a C++ implementation needs both attention paths.
 
 
 ## Findings from the FLA source (2026-10-26)

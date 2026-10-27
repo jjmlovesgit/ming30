@@ -226,6 +226,183 @@ def smoke_kda(model: Path, layer: int = 1) -> int:
     return 0 if ok else 1
 
 
+def rope_tables(tokens: int, rotary_dim: int, theta: float, device):
+    """Interleaved RoPE tables (rope_interleave=True): cos/sin of shape [T, rotary_dim/2]."""
+
+    positions = torch.arange(tokens, device=device, dtype=torch.float32)
+    inv_freq = 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32) / rotary_dim))
+    freqs = torch.outer(positions, inv_freq)
+    return freqs.cos(), freqs.sin()
+
+
+def apply_rope_interleaved(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate adjacent element pairs, which is what rope_interleave=True means."""
+
+    pairs = x.view(*x.shape[:-1], x.shape[-1] // 2, 2)
+    x1, x2 = pairs[..., 0], pairs[..., 1]
+    out1 = x1 * cos - x2 * sin
+    out2 = x1 * sin + x2 * cos
+    return torch.stack([out1, out2], dim=-1).reshape(*x.shape)
+
+
+def mla_layer(hidden: torch.Tensor, store: "WeightStore", cfg: dict, layer: int) -> torch.Tensor:
+    """BailingMoeV3MultiLatentAttention: LoRA q/kv, rope on 64 dims, SDPA, head-wise gate."""
+
+    prefix = f"model.model.layers.{layer}.attention."
+    heads = cfg["num_attention_heads"]
+    qk_nope = cfg["qk_nope_head_dim"]
+    qk_rope = cfg["qk_rope_head_dim"]
+    v_head = cfg["v_head_dim"]
+    kv_lora = cfg["kv_lora_rank"]
+    eps = cfg["rms_norm_eps"]
+    batch, tokens, _ = hidden.shape
+
+    q = rms_norm(F.linear(hidden, store.get(prefix + "q_a_proj.weight")),
+                 store.get(prefix + "q_a_layernorm.weight"), eps)
+    q = F.linear(q, store.get(prefix + "q_b_proj.weight")).view(batch, tokens, heads, qk_nope + qk_rope)
+    q = q.transpose(1, 2)                                    # [B, H, T, nope+rope]
+    q_pass, q_rot = q[..., :qk_nope], q[..., qk_nope:]
+
+    kv = F.linear(hidden, store.get(prefix + "kv_a_proj_with_mqa.weight"))
+    compressed, k_rot = kv[..., :kv_lora], kv[..., kv_lora:]
+    compressed = rms_norm(compressed, store.get(prefix + "kv_a_layernorm.weight"), eps)
+    k_pass = F.linear(compressed, store.get(prefix + "kv_b_proj.weight"))
+    k_pass = k_pass.view(batch, tokens, heads, qk_nope + v_head).transpose(1, 2)
+    k_nope, values = k_pass[..., :qk_nope], k_pass[..., qk_nope:]
+    k_rot = k_rot.view(batch, 1, tokens, qk_rope)
+
+    cos, sin = rope_tables(tokens, qk_rope, cfg["rope_theta"], hidden.device)
+    q_rot = apply_rope_interleaved(q_rot, cos, sin)
+    k_rot = apply_rope_interleaved(k_rot, cos, sin).expand(batch, heads, tokens, qk_rope)
+
+    query = torch.cat([q_pass, q_rot], dim=-1)
+    key = torch.cat([k_nope, k_rot], dim=-1)
+    attn = F.scaled_dot_product_attention(query, key, values, is_causal=True,
+                                          scale=(qk_nope + qk_rope) ** -0.5)
+    attn = attn.transpose(1, 2)                              # [B, T, H, v_head]
+
+    gate = torch.sigmoid(F.linear(hidden, store.get(prefix + "g_proj.weight")))  # head_wise
+    attn = attn * gate[..., None]
+    return F.linear(attn.reshape(batch, tokens, heads * v_head), store.get(prefix + "dense.weight"))
+
+
+def attention_kind(cfg: dict, layer: int) -> str:
+    """Hybrid: every fourth layer (3, 7, 11, ...) is MLA, the rest are KDA."""
+
+    return "mla" if (layer % 4 == 3) else "kda"
+
+
+def mlp_forward(x: torch.Tensor, store: "WeightStore", prefix: str) -> torch.Tensor:
+    gate = F.linear(x, store.get(prefix + ".gate_proj.weight"))
+    up = F.linear(x, store.get(prefix + ".up_proj.weight"))
+    return F.linear(F.silu(gate) * up, store.get(prefix + ".down_proj.weight"))
+
+
+def moe_forward(hidden: torch.Tensor, store: "WeightStore", cfg: dict, layer: int):
+    """BailingMoeV3SparseMoeBlock: routed top-k + shared expert on the same input."""
+
+    prefix = f"model.model.layers.{layer}.mlp"
+    x = hidden.reshape(-1, hidden.shape[-1])
+    top_idx, weights, logits = router(
+        x, store.get(prefix + ".gate.weight"), store.get(prefix + ".gate.expert_bias"),
+        cfg["n_group"], cfg["topk_group"], cfg["num_experts_per_tok"], cfg["routed_scaling_factor"])
+
+    y = torch.zeros_like(x)
+    for slot in range(cfg["num_experts_per_tok"]):
+        idx = top_idx[:, slot]
+        weight = weights[:, slot]
+        for expert in idx.unique().tolist():
+            mask = idx == expert
+            expert_prefix = f"{prefix}.experts.{expert}"
+            contribution = mlp_forward(x[mask], store, expert_prefix)
+            y[mask] += contribution * weight[mask].unsqueeze(-1)
+
+    y = y + mlp_forward(x, store, prefix + ".shared_experts")
+    return y.view_as(hidden), logits, top_idx
+
+
+def run_thinker(model: Path, text: str, prompt_ids: list[int], out_dir: Path) -> int:
+    """Full 24-layer forward with a capture point per layer."""
+
+    import numpy as np
+
+    store = WeightStore(model)
+    config = json.loads((model / "config.json").read_text(encoding="utf-8"))
+    cfg = config["llm_config"]
+    eps = cfg["rms_norm_eps"]
+
+    ids = torch.tensor([prompt_ids], dtype=torch.long)
+    hidden = store.get("model.model.word_embeddings.weight")[ids]        # [1, T, 1536]
+    captures = {"embedding": hidden.clone()}
+    router_captures = {}
+
+    for layer in range(cfg["num_hidden_layers"]):
+        prefix = f"model.model.layers.{layer}."
+        residual = hidden
+        normed = rms_norm(hidden, store.get(prefix + "input_layernorm.weight"), eps)
+        if attention_kind(cfg, layer) == "mla":
+            hidden = residual + mla_layer(normed, store, cfg, layer)
+        else:
+            hidden = residual + kda_layer(normed, store, cfg, layer)
+
+        residual = hidden
+        normed = rms_norm(hidden, store.get(prefix + "post_attention_layernorm.weight"), eps)
+        if layer < cfg["first_k_dense_replace"]:
+            block = mlp_forward(normed, store, prefix + "mlp")
+        else:
+            block, logits, top_idx = moe_forward(normed, store, cfg, layer)
+            router_captures[layer] = {
+                "logits": logits.detach().numpy(),
+                "top_idx": top_idx.detach().numpy(),
+            }
+        hidden = residual + block
+        captures[f"layer_{layer}"] = hidden.clone()
+
+    final = rms_norm(hidden, store.get("model.model.norm.weight"), eps)
+    stop_logits = F.linear(final[:, -1], store.get("stop_head.weight"), store.get("stop_head.bias"))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    arrays = {name: tensor.detach().float().numpy() for name, tensor in captures.items()}
+    arrays["final_norm"] = final.detach().float().numpy()
+    arrays["stop_logits"] = stop_logits.detach().float().numpy()
+    np.savez_compressed(out_dir / "thinker-41.npz", **arrays)
+
+    manifest = {
+        "stage": "B_thinker",
+        "text": text,
+        "prompt_ids": prompt_ids,
+        "token_count": len(prompt_ids),
+        "layers": cfg["num_hidden_layers"],
+        "capture_points": {
+            name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype),
+                   "mean": float(tensor.mean()), "std": float(tensor.std()),
+                   "l2": float(tensor.norm())}
+            for name, tensor in [("embedding", captures["embedding"]),
+                                 ("final_norm", final),
+                                 ("stop_logits", stop_logits)]
+        },
+        "layer_checksums": {
+            name: {"mean": float(t.mean()), "std": float(t.std()), "l2": float(t.norm())}
+            for name, t in captures.items() if name.startswith("layer_")
+        },
+        "router_layers": {str(k): {"top_idx_first_token": v["top_idx"][0].tolist()} for k, v in router_captures.items()},
+        "stop_logits": stop_logits.detach().numpy().tolist(),
+        "stop_decision": int(torch.argmax(stop_logits, dim=-1).item()),
+    }
+    (out_dir / "thinker-41.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    print(f"prompt tokens      : {len(prompt_ids)}")
+    print(f"embedding          : {tuple(captures['embedding'].shape)} {captures['embedding'].dtype}")
+    for layer in (0, 1, 11, 23):
+        t = captures[f"layer_{layer}"]
+        print(f"layer {layer:>2} hidden    : {tuple(t.shape)} {t.dtype} l2={t.norm().item():.4f}")
+    print(f"final_norm         : {tuple(final.shape)} {final.dtype} l2={final.norm().item():.4f}")
+    print(f"stop_logits        : {stop_logits.tolist()} decision={manifest['stop_decision']}")
+    print(f"expert choices L1  : {router_captures[1]['top_idx'][0].tolist()}")
+    print(f"written            : {out_dir/'thinker-41.npz'}")
+    return 0
+
+
 def smoke(model: Path, layer: int) -> int:
     store = WeightStore(model)
     config = json.loads((model / "config.json").read_text(encoding="utf-8"))
@@ -282,10 +459,16 @@ def main() -> int:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--layer", type=int, default=1)
     parser.add_argument("--kda", action="store_true", help="run the KDA layer smoke test")
+    parser.add_argument("--forward", action="store_true", help="run the full thinker forward")
+    parser.add_argument("--out", type=Path, default=Path("out/reference"))
     args = parser.parse_args()
+    root = args.model.resolve()
+    if args.forward:
+        ref = json.loads(Path(r"C:\Projects\ming30\out\reference\stage-a-segments.json").read_text(encoding="utf-8"))
+        return run_thinker(root, "The garden will remain open until sunset.", ref["flat_ids"], args.out)
     if args.kda:
-        return smoke_kda(args.model.resolve(), args.layer)
-    return smoke(args.model.resolve(), args.layer)
+        return smoke_kda(root, args.layer)
+    return smoke(root, args.layer)
 
 
 if __name__ == "__main__":
