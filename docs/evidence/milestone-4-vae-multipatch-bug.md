@@ -70,3 +70,55 @@ The reference config sets `use_sliding_window=True, sliding_window=64`; the Pyth
 comparable with C++. Once the multi-patch bug is fixed, the 64-token window is a
 separate check against the intended inference backend (flash-attention), not part of
 this parity result.
+
+
+## 6. Cause found: in-place rot_half corrupted RoPE at higher positions
+
+Token-2 trace, layer 0 (before -> after the fix):
+
+| checkpoint | before | after |
+|---|---|---|
+| `q_pre` (projection) | 3.10e-06 | 3.10e-06 |
+| `k_pre` | 3.34e-06 | 3.34e-06 |
+| `v` | 3.58e-07 | 3.58e-07 |
+| **`q_post` (after RoPE)** | **6.55e+00** | **3.10e-06** |
+| **`k_post`** | **4.34e+00** | **2.86e-06** |
+| scores | 4.41e+00 | 3.34e-06 |
+| softmax weights | 3.82e-01 | 2.57e-07 |
+| weighted value | 3.63e-02 | 4.40e-07 |
+
+`apply_rope` wrote in place while reading `original[index - half]` for the second half —
+that element had already been overwritten by the first half's rotation. So the first 32
+dimensions were correct and the second 32 were rotated from already-rotated values.
+
+Why it hid for so long: the corruption scales with the rotation angle, and position 0 has
+angle 0. Tokens 0–1 were therefore essentially clean (6e-07), while position 199 was
+badly wrong. It is also why the single-patch case passed: with only 4 tokens the largest
+angle is ~3 radians, and the fix changes that dump by just 1.4e-06.
+
+## 7. Both code paths, verified separately
+
+**Single-patch path (4 tokens):**
+
+| check | value |
+|---|---|
+| old (buggy) dump vs fixed dump, `decoder_hidden` | 1.37e-06 (so the earlier single-patch pass was not an artefact) |
+| fixed build vs Python single-patch reference, `decoder_hidden` | 2.38e-06 |
+| fixed build vs Python, waveform | 6.11e-10 |
+
+**Multi-patch path (50 patches / 200 tokens), fixed build vs Python full-causal:**
+
+| checkpoint | max_abs | rel_rmse |
+|---|---|---|
+| fc1 | 5.96e-07 | 1.15e-07 |
+| upsampled | 5.96e-07 | 1.15e-07 |
+| decoder_hidden | 2.42e-04 | 4.75e-06 |
+| spectral magnitude | 6.41e-04 | 2.04e-06 |
+| waveform | 3.09e-05 | 1.87e-05 |
+
+Waveform correlation between the two implementations: **1.00000000**; C++ waveform
+correlation with the original speech: **0.8654**, matching the Python round-trip.
+
+The two paths are distinct in this record: the 4-token pass validated the single-patch
+implementation (and, as it turns out, was insensitive to this bug), while the 50-patch
+comparison is what validates the multi-patch implementation now.

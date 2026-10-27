@@ -116,10 +116,13 @@ void rope_tables(size_t tokens, std::vector<float> & cos_table, std::vector<floa
 
 void apply_rope(float * head_vector, const float * cos_table, const float * sin_table, size_t position) {
     const size_t half = kHeadDim / 2;
+    // rotate_half must read the *original* values: writing in place would corrupt the
+    // second half, whose rotation reads the first half.
+    float original[kHeadDim];
+    std::memcpy(original, head_vector, sizeof(original));
     for (size_t index = 0; index < kHeadDim; ++index) {
-        const float value = head_vector[index];
-        const float rotated = index < half ? -head_vector[index + half] : head_vector[index - half];
-        head_vector[index] = value * cos_table[position * kHeadDim + index] +
+        const float rotated = index < half ? -original[index + half] : original[index - half];
+        head_vector[index] = original[index] * cos_table[position * kHeadDim + index] +
                              rotated * sin_table[position * kHeadDim + index];
     }
 }
@@ -205,6 +208,22 @@ void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & la
             weights.linear_op(normed.data(), block + "self_attn.v_proj", kHidden, kKvHeads * kHeadDim,
                 v.data() + token * kKvHeads * kHeadDim);
         }
+        const bool token_trace = (std::getenv("MING3_TINY_VAE_TOKEN") != nullptr) && layer == 0;
+        const size_t traced_token = token_trace ? static_cast<size_t>(std::atoi(std::getenv("MING3_TINY_VAE_TOKEN"))) : 0;
+        if (token_trace && traced_token < tokens) {
+            captures.push_back({"trace_q_pre_" + std::to_string(layer),
+                {1, static_cast<int64_t>(kHeads), static_cast<int64_t>(kHeadDim)},
+                std::vector<float>(q.begin() + traced_token * kHeads * kHeadDim,
+                                   q.begin() + (traced_token + 1) * kHeads * kHeadDim)});
+            captures.push_back({"trace_k_pre_" + std::to_string(layer),
+                {1, static_cast<int64_t>(kKvHeads), static_cast<int64_t>(kHeadDim)},
+                std::vector<float>(k.begin() + traced_token * kKvHeads * kHeadDim,
+                                   k.begin() + (traced_token + 1) * kKvHeads * kHeadDim)});
+            captures.push_back({"trace_v_" + std::to_string(layer),
+                {1, static_cast<int64_t>(kKvHeads), static_cast<int64_t>(kHeadDim)},
+                std::vector<float>(v.begin() + traced_token * kKvHeads * kHeadDim,
+                                   v.begin() + (traced_token + 1) * kKvHeads * kHeadDim)});
+        }
         for (size_t token = 0; token < tokens; ++token) {
             for (size_t head = 0; head < kHeads; ++head) {
                 apply_rope(q.data() + token * kHeads * kHeadDim + head * kHeadDim,
@@ -214,6 +233,20 @@ void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & la
                 apply_rope(k.data() + token * kKvHeads * kHeadDim + head * kHeadDim,
                     cos_table.data(), sin_table.data(), token);
             }
+        }
+        std::vector<float> trace_scores, trace_weights, trace_weighted;
+        if (token_trace && traced_token < tokens) {
+            captures.push_back({"trace_q_post_" + std::to_string(layer),
+                {1, static_cast<int64_t>(kHeads), static_cast<int64_t>(kHeadDim)},
+                std::vector<float>(q.begin() + traced_token * kHeads * kHeadDim,
+                                   q.begin() + (traced_token + 1) * kHeads * kHeadDim)});
+            captures.push_back({"trace_k_post_" + std::to_string(layer),
+                {1, static_cast<int64_t>(kKvHeads), static_cast<int64_t>(kHeadDim)},
+                std::vector<float>(k.begin() + traced_token * kKvHeads * kHeadDim,
+                                   k.begin() + (traced_token + 1) * kKvHeads * kHeadDim)});
+            trace_scores.assign(kHeads * (traced_token + 1), 0.0f);
+            trace_weights.assign(kHeads * (traced_token + 1), 0.0f);
+            trace_weighted.assign(kHeads * kHeadDim, 0.0f);
         }
         // full causal attention across every token (matches the Python SDPA run)
         const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
@@ -230,11 +263,17 @@ void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & la
                     }
                     scores[key] = sum * scale;
                     best = std::max(best, scores[key]);
+                    if (token_trace && token == traced_token) trace_scores[head * (traced_token + 1) + key] = scores[key];
                 }
                 float total = 0.0f;
                 for (size_t key = 0; key <= token; ++key) {
                     scores[key] = std::exp(scores[key] - best);
                     total += scores[key];
+                }
+                if (token_trace && token == traced_token) {
+                    for (size_t key = 0; key <= token; ++key) {
+                        trace_weights[head * (traced_token + 1) + key] = scores[key] / total;
+                    }
                 }
                 for (size_t dim = 0; dim < kHeadDim; ++dim) {
                     float sum = 0.0f;
@@ -242,8 +281,17 @@ void dump_vae_probe(const MingTinyAssets & assets, const std::vector<float> & la
                         sum += scores[key] / total * v[key * kKvHeads * kHeadDim + kv_head * kHeadDim + dim];
                     }
                     attn[token * kHeads * kHeadDim + head * kHeadDim + dim] = sum;
+                    if (token_trace && token == traced_token) trace_weighted[head * kHeadDim + dim] = sum;
                 }
             }
+        }
+        if (token_trace && traced_token < tokens) {
+            captures.push_back({"trace_scores_" + std::to_string(layer),
+                {1, static_cast<int64_t>(kHeads), static_cast<int64_t>(traced_token + 1)}, trace_scores});
+            captures.push_back({"trace_weights_" + std::to_string(layer),
+                {1, static_cast<int64_t>(kHeads), static_cast<int64_t>(traced_token + 1)}, trace_weights});
+            captures.push_back({"trace_weighted_" + std::to_string(layer),
+                {1, static_cast<int64_t>(kHeads), static_cast<int64_t>(kHeadDim)}, trace_weighted});
         }
         for (size_t token = 0; token < tokens; ++token) {
             weights.linear_op(attn.data() + token * kHeads * kHeadDim, block + "self_attn.o_proj",
