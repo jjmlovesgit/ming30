@@ -18,21 +18,41 @@ Bit-identical: `max_abs = 0.0`. That validates, end to end:
 - GGUF weight loading of `model.word_embeddings.weight` from the BF16 package;
 - the bf16 → float32 widening used on both sides.
 
-## Naming rule discovered here
+## Name mapping, verified against GGUF metadata
 
-The package stores logical names with **one leading `model.` stripped**, so the HF
-name and the tensor name to request differ:
+Not a blanket prefix rule. The map is derived from the package's own
+`audiocpp.tensor_names` and checked in both directions by
+`reference/drafts/build_name_map.py`, which writes `reference/name-map.json`.
+Verification: **2,141 package tensors, 10,285 HF tensors, 0 unmapped names,
+0 missing sources, 0 unconsumed HF tensors** — exact coverage both ways.
 
-| HF / safetensors | package logical name |
-|---|---|
-| `model.model.word_embeddings.weight` | `model.word_embeddings.weight` |
-| `model.model.norm.weight` | `model.norm.weight` |
-| `model.model.layers.N.attention.q_proj.weight` | `model.layers.N.attention.q_proj.weight` |
-| `model.lm_head.weight` | `lm_head.weight` |
+| family | package tensor | source | count |
+|---|---|---|---|
+| embedding | `model.word_embeddings.weight` | `model.model.word_embeddings.weight` | 1 |
+| final_norm | `model.norm.weight` | `model.model.norm.weight` | 1 |
+| **lm_head** | `lm_head.weight` | `model.lm_head.weight` | 1 |
+| backbone_layer | `model.layers.*` | `model.model.layers.*` (drop exactly one `model.`) | 448 |
+| expert_bank | `model.layers.N.mlp.experts.{gate,up,down}_proj.weight` | **128** × `model.model.layers.N.mlp.experts.E.{...}.weight` stacked on the expert axis | 69 banks ← 8,832 |
+| vae | `audio.encoder.*`, `audio.decoder.*` | **unchanged** | 643 |
+| talker | `flowloss.*`, `linear_proj_audio.*`, `spk_head*`, `stop_head*` | **unchanged** | 359 |
+| speaker_campplus | `speaker_encoder.*` | **derived from `campplus.onnx`**, not a safetensors tensor | 619 |
 
-The first attempt requested the HF name and failed with `missing tensor:
-model.model.word_embeddings.weight` — worth knowing before writing the rest of the
-loader.
+Three different paths exist, which is why one rule cannot cover them: the backbone
+drops a prefix, `lm_head` is renamed while the components keep HF names verbatim,
+the speaker tensors have no safetensors source at all, and routed experts are
+many-to-one.
+
+The first attempt requested the HF name `model.model.word_embeddings.weight` and
+failed with `missing tensor` — the map now makes that class of error impossible
+before a layer is written.
+
+## Rerun after the mapping work
+
+```
+PASS  embedding      max_abs=0.000e+00 rel_rmse=0.000e+00 l2_ref=2.501 l2_cpp=2.501
+```
+
+Unchanged: bit-identical over the 41 rows, against a freshly regenerated dump.
 
 ## Protocol for the remaining captures
 
