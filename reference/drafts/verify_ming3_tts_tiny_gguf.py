@@ -145,60 +145,69 @@ def main() -> int:
         check("tokenizer.json bytes identical", hashlib.sha256(payload).hexdigest() == hashlib.sha256(original).hexdigest(),
               f"{len(payload)} vs {len(original)} bytes")
 
-    # 4. expert bank: type, size, dequantised error
+    # 4. expert bank: type, size, and content (hash for bf16, dequant error for q8)
     logical = f"model.layers.{args.bank_layer}.mlp.experts.{args.bank_projection}.weight"
     if logical not in names:
         check("bank present", False, logical)
         return 1
     bank_index = names.index(logical)
     info = by_name[f"_audiocpp.{bank_index}"]
-    width = 1536            # moe_intermediate is the contracted dim for gate/up
-    rows = 128 * 512
-    expected_bytes = rows * (width // 32) * 34
-    if args.expect == "q8_0":
-        check("bank type == Q8_0", info["type"] == 8, f"type {info['type']}")
-        check("bank byte size == rows*(width/32)*34", info["nbytes"] if "nbytes" in info else expected_bytes,
-              f"{expected_bytes} expected")
-    else:
-        check("bank type == BF16", info["type"] == 30, f"type {info['type']}")
-
-    # read the bank's data and compare against the source stack
-    from gguf import GGUFReader
-    reader = GGUFReader(str(args.gguf), mode="r")
-    tensor = {t.name: t for t in reader.tensors}[f"_audiocpp.{bank_index}"]
-    raw = np.asarray(tensor.data).tobytes()
-    check("bank bytes match declared size", len(raw) == expected_bytes if args.expect == "q8_0" else True,
-          f"{len(raw)} bytes")
 
     from safetensors import safe_open
     import torch
 
     weight_map = json.loads((args.source / "model.safetensors.index.json").read_text())["weight_map"]
-    reference = np.empty((128, 512, width), dtype=np.float32)
-    for expert in range(128):
-        name = f"model.model.layers.{args.bank_layer}.mlp.experts.{expert}.{args.bank_projection}.weight"
-        with safe_open(args.source / weight_map[name], framework="pt", device="cpu") as handle:
-            reference[expert] = handle.get_tensor(name).float().numpy()
+    first = f"model.model.layers.{args.bank_layer}.mlp.experts.0.{args.bank_projection}.weight"
+    with safe_open(args.source / weight_map[first], framework="pt", device="cpu") as handle:
+        expert_shape = list(handle.get_tensor(first).shape)
+    rows = 128 * expert_shape[0]
+    width = expert_shape[1]
+    bank_shape = [128, *expert_shape]
+
+    check("gguf bank shape (ggml order)", info["shape"] == list(reversed(bank_shape)), str(info["shape"]))
+    if args.expect == "q8_0":
+        expected = rows * (width // 32) * 34
+        check("bank type == Q8_0", info["type"] == 8, f"type {info['type']}")
+    else:
+        expected = 128 * expert_shape[0] * expert_shape[1] * 2
+        check("bank type == BF16", info["type"] == 30, f"type {info['type']}")
+
+    from gguf import GGUFReader
+    reader = GGUFReader(str(args.gguf), mode="r")
+    raw = np.asarray({t.name: t for t in reader.tensors}[f"_audiocpp.{bank_index}"].data).tobytes()
+    check("bank bytes match declared size", len(raw) == expected, f"{len(raw)} vs {expected}")
 
     if args.expect == "q8_0":
         from gguf import quants
-        # dequantize needs the byte-shaped 2-D array (rows, blocks*34), not a flat buffer
-        bytes_per_row = width // 32 * 34
-        blocks_2d = np.frombuffer(raw, dtype=np.uint8).reshape(rows, bytes_per_row)
-        dequant = quants.dequantize(blocks_2d, quants.GGMLQuantizationType.Q8_0)
-        dequant = np.asarray(dequant, dtype=np.float32).reshape(128, 512, width)
-    else:
-        dequant = np.frombuffer(raw, dtype=np.uint16).view(np.float32) if False else None
-        dequant = reference  # bf16 path is compared by hash elsewhere
 
-    if dequant is not None:
+        bytes_per_row = width // 32 * 34
+        blocks = np.frombuffer(raw, dtype=np.uint8).reshape(rows, bytes_per_row)
+        dequant = np.asarray(quants.dequantize(blocks, quants.GGMLQuantizationType.Q8_0), dtype=np.float32)
+        dequant = dequant.reshape(bank_shape)
+
+        reference = np.empty(bank_shape, dtype=np.float32)
+        for expert in range(128):
+            name = f"model.model.layers.{args.bank_layer}.mlp.experts.{expert}.{args.bank_projection}.weight"
+            with safe_open(args.source / weight_map[name], framework="pt", device="cpu") as handle:
+                reference[expert] = handle.get_tensor(name).float().numpy()
+
         diff = dequant - reference
         max_abs = float(np.abs(diff).max())
         rmse = float(np.sqrt((diff ** 2).mean()))
         signal = float(np.sqrt((reference ** 2).mean()))
         check("dequantised max abs error < 0.02", max_abs < 0.02, f"{max_abs:.5f}")
-        check("dequantised relative RMSE < 2%", rmse / signal < 0.02,
-              f"rmse={rmse:.5f} signal={signal:.4f} rel={rmse/signal*100:.3f}%")
+        check("dequantised relative RMSE < 2%", rmse / signal < 0.02, f"rel={rmse/signal*100:.3f}%")
+    else:
+        # Byte comparison needs no reshape: hash what the package holds against the
+        # 128 source experts in order, which is exactly the property that matters.
+        digest_source = hashlib.sha256()
+        for expert in range(128):
+            name = f"model.model.layers.{args.bank_layer}.mlp.experts.{expert}.{args.bank_projection}.weight"
+            with safe_open(args.source / weight_map[name], framework="pt", device="cpu") as handle:
+                digest_source.update(handle.get_tensor(name).view(torch.uint16).numpy().tobytes())
+        check("bf16 bank bytes equal source stack",
+              hashlib.sha256(raw).hexdigest() == digest_source.hexdigest(),
+              f"{len(raw)/1e6:.0f} MB over 128 experts")
 
     print()
     if FAILURES:

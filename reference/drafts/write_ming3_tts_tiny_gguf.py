@@ -315,38 +315,41 @@ def main() -> int:
     print(f"  embedded files  : {len(file_names)} totaling {total/1e6:.1f} MB "
           f"(tokenizer.json {'included' if 'tokenizer.json' in file_names else 'MISSING'})")
 
-    payloads = []
+    # Declare every tensor first (shape/dtype only), then stream the data one tensor
+    # at a time. Buffering all payloads would hold the whole model in RAM (~17 GB for
+    # the bf16 package) and OOM before a single byte is written.
     for index, item in enumerate(items):
         dtype = item["dtype"]
-        values = gather(item, tensors)
         if quant_banks and is_bank(item["logical"]):
-            blocks = q8_blocks(values)
-            # gguf-py wants the *byte* shape for a quantised tensor: the last dim is
-            # bytes-per-row (values/32*34), which it converts back to logical dims.
+            width = int(item["shape"][-1])
             byte_shape = list(item["shape"])
-            byte_shape[-1] = byte_shape[-1] // 32 * 34
-            writer.add_tensor_info(f"_audiocpp.{index}", byte_shape, np.dtype(np.uint8),
-                                   blocks.nbytes, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
-            payloads.append(blocks)
+            byte_shape[-1] = width // 32 * 34
+            nbytes = int(np.prod(byte_shape))
+            writer.add_tensor_info(f"_audiocpp.{index}", byte_shape, np.dtype(np.uint8), nbytes,
+                                   raw_dtype=gguf.GGMLQuantizationType.Q8_0)
         else:
             numpy_type = DTYPES[dtype]
-            raw = np.ascontiguousarray(values.astype(numpy_type, copy=False))
-            writer.add_tensor_info(f"_audiocpp.{index}", item["shape"], np.dtype(numpy_type),
-                                   raw.nbytes, raw_dtype=gguf.GGMLQuantizationType(TYPE[dtype]))
-            payloads.append(raw)
-        if args.log and index % 500 == 0:
-            print(f"  planned {index + 1}/{len(items)}", flush=True)
+            nbytes = int(np.prod(item["shape"])) * np.dtype(numpy_type).itemsize
+            writer.add_tensor_info(f"_audiocpp.{index}", item["shape"], np.dtype(numpy_type), nbytes,
+                                   raw_dtype=gguf.GGMLQuantizationType(TYPE[dtype]))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_ti_data_to_file()
 
     banks_written = 0
-    for index, payload in enumerate(payloads):
-        writer.write_tensor_data(payload)
-        banks_written += int(is_bank(items[index]["logical"]))
+    for index, item in enumerate(items):
+        values = gather(item, tensors)
+        if is_bank(item["logical"]):
+            banks_written += 1
+        if quant_banks and is_bank(item["logical"]):
+            writer.write_tensor_data(q8_blocks(values))
+        else:
+            numpy_type = DTYPES[item["dtype"]]
+            writer.write_tensor_data(np.ascontiguousarray(values.astype(numpy_type, copy=False)))
+        del values
         if args.log and index % 500 == 0:
-            print(f"  wrote {index + 1}/{len(payloads)}", flush=True)
+            print(f"  wrote {index + 1}/{len(items)}", flush=True)
     writer.close()
 
     print(f"\nwrote {args.output}  {args.output.stat().st_size/1e6:.1f} MB")
