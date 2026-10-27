@@ -264,6 +264,23 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
         if (const char * res_env = std::getenv("MING3_TINY_GPU_RESIDENCY"); res_env != nullptr && *res_env != '\0') {
             run_gpu_residency_probe(*assets);
         }
+
+        // Podcast prompt assembly: reference latents supplied from file (test bridge).
+        if (const char * latent_file = std::getenv("MING3_TINY_PODCAST_LATENTS_FILE");
+            latent_file != nullptr && *latent_file != '\0') {
+            std::ifstream in(latent_file, std::ios::binary | std::ios::ate);
+            if (!in) throw std::runtime_error(std::string("cannot open ") + latent_file);
+            const auto bytes = static_cast<size_t>(in.tellg());
+            in.seekg(0);
+            std::vector<float> latents(bytes / sizeof(float));
+            in.read(reinterpret_cast<char *>(latents.data()), static_cast<std::streamsize>(bytes));
+            const char * script_env = std::getenv("MING3_TINY_PODCAST_SCRIPT");
+            const char * reference_env = std::getenv("MING3_TINY_PODCAST_REFERENCE");
+            const char * out_env = std::getenv("MING3_TINY_PODCAST_ASSEMBLE_DIR");
+            dump_podcast_prompt_probe(*assets, script_env != nullptr ? script_env : "",
+                reference_env != nullptr ? reference_env : "", latents, latents.size() / 64,
+                std::filesystem::path{out_env != nullptr ? out_env : "podcast-embeds"});
+        }
     } catch (const std::exception & error) {
         std::printf("  prompt stage A  : FAILED: %s\n", error.what());
     }

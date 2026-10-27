@@ -1,6 +1,7 @@
 #include "engine/models/ming3_tts_tiny/loop.h"
 
 #include "engine/models/ming3_tts_tiny/flow.h"
+#include "engine/models/ming3_tts_tiny/prompt.h"
 #include "engine/models/ming3_tts_tiny/thinker.h"
 
 #include <cmath>
@@ -251,6 +252,69 @@ void run_loop_patch_seeded(const MingTinyAssets & assets, const std::vector<floa
     latent_out = flow_sample_from_noise(assets, cond, noise, history, cfg, flow_steps);
     feedback_out.assign(kHiddenLlm, 0.0f);
     aggregator(latent_out.data(), feedback_out.data());
+}
+
+void dump_podcast_prompt_probe(const MingTinyAssets & assets, const std::string & script,
+    const std::string & reference_text, const std::vector<float> & reference_latents,
+    size_t latent_tokens, const std::filesystem::path & directory) {
+    if (reference_latents.size() != latent_tokens * kLatent) {
+        throw std::runtime_error("podcast probe: reference latents do not match the placeholder count");
+    }
+
+    MingTinyPromptBuilder prompts{tokenizers::LlamaBpeTokenizerSpec{{}, {},
+        assets.resources.require_file("tokenizer_config"), assets.resources.require_file("tokenizer_json"),
+        tokenizers::LlamaBpePreTokenizer::BailingMoe}, MingTinySpecialTokens{}};
+    const auto segments = prompts.build_podcast_segments(script, reference_text, latent_tokens);
+    std::vector<int32_t> ids;
+    size_t prompt_start = 0;
+    size_t speaker_position = 0;
+    for (const auto & [name, segment] : segments) {
+        if (name == "prompt_latents") prompt_start = ids.size();
+        if (name == "speaker_block") speaker_position = ids.size() + 1;
+        ids.insert(ids.end(), segment.begin(), segment.end());
+    }
+
+    const auto table_tensor = assets.weights->require_tensor("model.word_embeddings.weight",
+        assets::TensorStorageType::BF16,
+        Shape{assets.config.vocabulary_size, assets.config.hidden_size});
+    std::vector<float> table(table_tensor.bytes.size() / sizeof(uint16_t));
+    {
+        const auto * raw = reinterpret_cast<const uint16_t *>(table_tensor.bytes.data());
+        for (size_t index = 0; index < table.size(); ++index) table[index] = bf16_to_float(raw[index]);
+    }
+
+    const size_t tokens = ids.size();
+    std::vector<float> embeds(tokens * kHiddenLlm);
+    for (size_t row = 0; row < tokens; ++row) {
+        std::memcpy(embeds.data() + row * kHiddenLlm,
+            table.data() + static_cast<size_t>(ids[row]) * kHiddenLlm, kHiddenLlm * sizeof(float));
+    }
+
+    Aggregator aggregator(*assets.weights, "linear_proj_audio.");
+    for (size_t patch = 0; patch < latent_tokens; ++patch) {
+        aggregator(reference_latents.data() + patch * kLatent, embeds.data() + (prompt_start + patch) * kHiddenLlm);
+    }
+
+    // spk_head(zeros) == its bias, which is the documented missing-reference case
+    const auto bias_tensor = assets.weights->require_tensor("spk_head.bias",
+        assets::TensorStorageType::BF16, Shape{static_cast<int64_t>(kHiddenLlm)});
+    const auto * bias_raw = reinterpret_cast<const uint16_t *>(bias_tensor.bytes.data());
+    for (size_t index = 0; index < kHiddenLlm; ++index) {
+        embeds[speaker_position * kHiddenLlm + index] = bf16_to_float(bias_raw[index]);
+    }
+
+    std::filesystem::create_directories(directory);
+    std::ofstream(directory / "embeds.bin", std::ios::binary)
+        .write(reinterpret_cast<const char *>(embeds.data()),
+            static_cast<std::streamsize>(embeds.size() * sizeof(float)));
+    std::ofstream manifest(directory / "manifest.json");
+    manifest << "{\n  \"tokens\": " << tokens << ",\n  \"prompt_start\": " << prompt_start
+             << ",\n  \"speaker_position\": " << speaker_position << ",\n  \"latent_tokens\": "
+             << latent_tokens << ",\n  \"ids\": [";
+    for (size_t index = 0; index < ids.size(); ++index) manifest << (index ? "," : "") << ids[index];
+    manifest << "]\n}\n";
+    std::printf("  podcast assemble: %zu ids (placeholders %zu..%zu), speaker row %zu\n", tokens, prompt_start,
+        tokens - 1, speaker_position);
 }
 
 void dump_loop_probe(const MingTinyAssets & assets, const std::vector<int32_t> & prompt_ids,

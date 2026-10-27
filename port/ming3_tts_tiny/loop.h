@@ -25,6 +25,13 @@ void run_loop_patch_seeded(const MingTinyAssets & assets, const std::vector<floa
     const std::vector<float> & noise, const std::vector<float> & history, float cfg, int flow_steps,
     std::vector<float> & latent_out, std::vector<float> & feedback_out);
 
+// Assemble the podcast prompt embedding matrix: word embeddings for the podcast ids,
+// per-latent Aggregator output in the placeholder rows, spk_head(zeros) in the speaker row.
+// Reference latents are supplied from a file (test bridge until the encoder is ported).
+void dump_podcast_prompt_probe(const MingTinyAssets & assets, const std::string & script,
+    const std::string & reference_text, const std::vector<float> & reference_latents,
+    size_t latent_tokens, const std::filesystem::path & directory);
+
 void dump_loop_probe(const MingTinyAssets & assets, const std::vector<int32_t> & prompt_ids,
     const std::vector<float> & noises, size_t patches, float cfg, int flow_steps,
     const std::filesystem::path & directory);
