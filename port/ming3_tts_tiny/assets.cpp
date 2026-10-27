@@ -1,6 +1,7 @@
 #include "engine/models/ming3_tts_tiny/assets.h"
 
 #include "engine/framework/model_spec/package.h"
+#include "engine/models/ming3_tts_tiny/prompt.h"
 
 #include <cstdio>
 #include <string>
@@ -78,6 +79,32 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
             shape_text(bank->shape).c_str());
     } else {
         std::printf("  expert bank     : MISSING\n");
+    }
+    // Stage A: reproduce the reference prompt token ids (see
+    // out/reference/stage-a-segments.json) before any model maths is attempted.
+    try {
+        tokenizers::LlamaBpeTokenizerSpec spec{{}, {}, assets->resources.require_file("tokenizer_config"),
+            assets->resources.require_file("tokenizer_json"),
+            tokenizers::LlamaBpePreTokenizer::BailingMoe};
+        MingTinyPromptBuilder prompts(std::move(spec), MingTinySpecialTokens{});
+        const std::string probe_text = "The garden will remain open until sunset.";
+        const auto segments = prompts.build_segments(probe_text);
+        std::printf("  prompt stage A  : text=%s\n", probe_text.c_str());
+        size_t total = 0;
+        for (const auto & [name, ids] : segments) {
+            total += ids.size();
+            std::printf("    %-16s ids=%zu\n", name.c_str(), ids.size());
+        }
+        const auto prompt = prompts.build(probe_text);
+        std::printf("    total              =%zu (segments %zu)\n", prompt.ids.size(), total);
+        std::printf("    speaker_position   =%zu\n", prompt.speaker_embedding_position);
+        std::printf("    ids=");
+        for (size_t index = 0; index < prompt.ids.size(); ++index) {
+            std::printf("%s%d", index ? "," : "", prompt.ids[index]);
+        }
+        std::printf("\n");
+    } catch (const std::exception & error) {
+        std::printf("  prompt stage A  : FAILED: %s\n", error.what());
     }
     std::printf("  inference       : not implemented (milestone 1: structural verification only)\n");
     std::fflush(stdout);
