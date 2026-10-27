@@ -317,9 +317,19 @@ void dump_podcast_prompt_probe(const MingTinyAssets & assets, const std::string 
         tokens - 1, speaker_position);
 }
 
+void dump_loop_probe_with_embeds(const MingTinyAssets & assets, const std::vector<int32_t> & prompt_ids,
+    const std::vector<float> & prefill_embeds, const std::vector<float> & noises, size_t patches, float cfg,
+    int flow_steps, const std::filesystem::path & directory);
+
 void dump_loop_probe(const MingTinyAssets & assets, const std::vector<int32_t> & prompt_ids,
     const std::vector<float> & noises, size_t patches, float cfg, int flow_steps,
     const std::filesystem::path & directory) {
+    dump_loop_probe_with_embeds(assets, prompt_ids, {}, noises, patches, cfg, flow_steps, directory);
+}
+
+void dump_loop_probe_with_embeds(const MingTinyAssets & assets, const std::vector<int32_t> & prompt_ids,
+    const std::vector<float> & prefill_embeds, const std::vector<float> & noises, size_t patches, float cfg,
+    int flow_steps, const std::filesystem::path & directory) {
     if (noises.size() != patches * kLatent) throw std::runtime_error("loop probe: noise size mismatch");
 
     Aggregator aggregator(*assets.weights, "linear_proj_audio.");
@@ -333,10 +343,15 @@ void dump_loop_probe(const MingTinyAssets & assets, const std::vector<int32_t> &
     }
     const std::vector<float> & table = table_values;
 
-    std::vector<float> embeds(prompt_ids.size() * kHiddenLlm);
-    for (size_t row = 0; row < prompt_ids.size(); ++row) {
-        std::memcpy(embeds.data() + row * kHiddenLlm,
-            table.data() + static_cast<size_t>(prompt_ids[row]) * kHiddenLlm, kHiddenLlm * sizeof(float));
+    std::vector<float> embeds;
+    if (!prefill_embeds.empty()) {
+        embeds = prefill_embeds;   // podcast prompt assembled by the caller
+    } else {
+        embeds.resize(prompt_ids.size() * kHiddenLlm);
+        for (size_t row = 0; row < prompt_ids.size(); ++row) {
+            std::memcpy(embeds.data() + row * kHiddenLlm,
+                table.data() + static_cast<size_t>(prompt_ids[row]) * kHiddenLlm, kHiddenLlm * sizeof(float));
+        }
     }
 
     std::vector<float> history(kLatent, 0.0f);
@@ -347,10 +362,11 @@ void dump_loop_probe(const MingTinyAssets & assets, const std::vector<int32_t> &
     // Prefill the prompt once, then advance one projected latent per patch. This is the
     // decode path: each patch costs a single-token step instead of a full recompute.
     ThinkerCache cache;
-    thinker_prefill_cached(assets, embeds, prompt_ids.size(), cache, final_norm);
+    const size_t prefill_rows = embeds.size() / kHiddenLlm;
+    thinker_prefill_cached(assets, embeds, prefill_rows, cache, final_norm);
 
     for (size_t patch = 0; patch < patches; ++patch) {
-        const size_t tokens = prompt_ids.size() + patch;
+        const size_t tokens = prefill_rows + patch;
         if (patch > 0) {
             thinker_step_cached(assets, feedback, cache, final_norm);
         }

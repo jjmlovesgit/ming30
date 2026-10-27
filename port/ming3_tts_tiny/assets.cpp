@@ -197,8 +197,27 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
             int flow_steps = 10;
             if (const char * steps_env = std::getenv("MING3_TINY_LOOP_FLOW_STEPS"); steps_env != nullptr) flow_steps = std::atoi(steps_env);
             const char * loop_dir = std::getenv("MING3_TINY_LOOP_DUMP_DIR");
-            dump_loop_probe(*assets, prompt.ids, noises, noises.size() / 64, cfg, flow_steps,
-                std::filesystem::path{loop_dir != nullptr ? loop_dir : "loop-dump"});
+            const std::filesystem::path destination{loop_dir != nullptr ? loop_dir : "loop-dump"};
+            std::vector<float> prefill;
+            if (const char * embeds_path = std::getenv("MING3_TINY_LOOP_PREEMBEDS");
+                embeds_path != nullptr && *embeds_path != '\0') {
+                std::ifstream embeds_in(embeds_path, std::ios::binary | std::ios::ate);
+                if (!embeds_in) throw std::runtime_error(std::string("cannot open ") + embeds_path);
+                const auto embeds_bytes = static_cast<size_t>(embeds_in.tellg());
+                embeds_in.seekg(0);
+                if (embeds_bytes % (1536 * sizeof(float)) != 0) {
+                    throw std::runtime_error("prefill embeddings are not a whole number of 1536-wide rows");
+                }
+                prefill.resize(embeds_bytes / sizeof(float));
+                embeds_in.read(reinterpret_cast<char *>(prefill.data()), static_cast<std::streamsize>(embeds_bytes));
+                std::printf("  loop prefill    : %zu rows from %s\n", prefill.size() / 1536, embeds_path);
+            }
+            if (prefill.empty()) {
+                dump_loop_probe(*assets, prompt.ids, noises, noises.size() / 64, cfg, flow_steps, destination);
+            } else {
+                dump_loop_probe_with_embeds(*assets, prompt.ids, prefill, noises, noises.size() / 64, cfg,
+                    flow_steps, destination);
+            }
         }
 
         // Seeded single patch: enter with an exact embedding history and noise, so a

@@ -32,6 +32,11 @@ void dump_podcast_prompt_probe(const MingTinyAssets & assets, const std::string 
     const std::string & reference_text, const std::vector<float> & reference_latents,
     size_t latent_tokens, const std::filesystem::path & directory);
 
+// Same loop, but prefilled with a caller-assembled prompt embedding matrix (podcast).
+void dump_loop_probe_with_embeds(const MingTinyAssets & assets, const std::vector<int32_t> & prompt_ids,
+    const std::vector<float> & prefill_embeds, const std::vector<float> & noises, size_t patches, float cfg,
+    int flow_steps, const std::filesystem::path & directory);
+
 void dump_loop_probe(const MingTinyAssets & assets, const std::vector<int32_t> & prompt_ids,
     const std::vector<float> & noises, size_t patches, float cfg, int flow_steps,
     const std::filesystem::path & directory);
