@@ -13,6 +13,9 @@ namespace engine::models::ming3_tts_tiny {
 // plain-torch reference. Layer 0 only for now: KDA attention, dense MLP, residuals.
 // cuBLAS microbenchmark of one KDA layer's projections at the one-token decode shape.
 void run_gpu_layer_benchmark(const MingTinyAssets & assets, int iterations);
+// GPU test of routed experts for one MoE layer, with fixed expert ids from the
+// reference run: per-expert outputs and the combined layer output.
+void run_gpu_moe_benchmark(const MingTinyAssets & assets, int iterations);
 
 // Per-layer decode state.
 //   KDA keeps the recurrent matrix S plus the last three pre-convolution rows for
