@@ -195,6 +195,18 @@ private:
 
 }  // namespace
 
+void run_loop_patch_seeded(const MingTinyAssets & assets, const std::vector<float> & embeds, size_t tokens,
+    const std::vector<float> & noise, const std::vector<float> & history, float cfg, int flow_steps,
+    std::vector<float> & latent_out, std::vector<float> & feedback_out) {
+    Aggregator aggregator(*assets.weights, "linear_proj_audio.");
+    std::vector<float> final_norm;
+    thinker_forward_embeds(assets, embeds, tokens, final_norm);
+    std::vector<float> cond(final_norm.end() - kHiddenLlm, final_norm.end());
+    latent_out = flow_sample_from_noise(assets, cond, noise, history, cfg, flow_steps);
+    feedback_out.assign(kHiddenLlm, 0.0f);
+    aggregator(latent_out.data(), feedback_out.data());
+}
+
 void dump_loop_probe(const MingTinyAssets & assets, const std::vector<int32_t> & prompt_ids,
     const std::vector<float> & noises, size_t patches, float cfg, int flow_steps,
     const std::filesystem::path & directory) {

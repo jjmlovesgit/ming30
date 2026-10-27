@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -175,6 +176,45 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
             const char * loop_dir = std::getenv("MING3_TINY_LOOP_DUMP_DIR");
             dump_loop_probe(*assets, prompt.ids, noises, noises.size() / 64, cfg, flow_steps,
                 std::filesystem::path{loop_dir != nullptr ? loop_dir : "loop-dump"});
+        }
+
+        // Seeded single patch: enter with an exact embedding history and noise, so a
+        // split point can be judged independently of earlier drift.
+        if (const char * seeds = std::getenv("MING3_TINY_SEED_EMBEDS"); seeds != nullptr && *seeds != '\0') {
+            const auto read_all = [](const char * path, size_t stride, std::vector<float> & values) {
+                std::ifstream in(path, std::ios::binary | std::ios::ate);
+                if (!in) throw std::runtime_error(std::string("cannot open ") + path);
+                const auto bytes = static_cast<size_t>(in.tellg());
+                in.seekg(0);
+                if (bytes % (stride * sizeof(float)) != 0) throw std::runtime_error("seed file has the wrong stride");
+                values.resize(bytes / sizeof(float));
+                in.read(reinterpret_cast<char *>(values.data()), static_cast<std::streamsize>(bytes));
+            };
+            std::vector<float> embeds;
+            read_all(seeds, 1536, embeds);
+            std::vector<float> noise;
+            const char * noise_path = std::getenv("MING3_TINY_SEED_NOISE");
+            if (noise_path == nullptr) throw std::runtime_error("MING3_TINY_SEED_NOISE is required with MING3_TINY_SEED_EMBEDS");
+            read_all(noise_path, 64, noise);
+            std::vector<float> history(64, 0.0f);
+            if (const char * history_path = std::getenv("MING3_TINY_SEED_HISTORY"); history_path != nullptr && *history_path != '\0') {
+                read_all(history_path, 64, history);
+            }
+            float cfg = 2.0f;
+            if (const char * cfg_env = std::getenv("MING3_TINY_LOOP_CFG"); cfg_env != nullptr) cfg = static_cast<float>(std::atof(cfg_env));
+            int flow_steps = 10;
+            if (const char * steps_env = std::getenv("MING3_TINY_LOOP_FLOW_STEPS"); steps_env != nullptr) flow_steps = std::atoi(steps_env);
+            std::vector<float> latent, feedback;
+            run_loop_patch_seeded(*assets, embeds, embeds.size() / 1536, noise, history, cfg, flow_steps, latent, feedback);
+            const char * out_dir = std::getenv("MING3_TINY_SEED_DUMP_DIR");
+            const std::filesystem::path out{out_dir != nullptr ? out_dir : "seed-dump"};
+            std::filesystem::create_directories(out);
+            std::ofstream(out / "latent.bin", std::ios::binary)
+                .write(reinterpret_cast<const char *>(latent.data()), static_cast<std::streamsize>(latent.size() * sizeof(float)));
+            std::ofstream(out / "feedback.bin", std::ios::binary)
+                .write(reinterpret_cast<const char *>(feedback.data()), static_cast<std::streamsize>(feedback.size() * sizeof(float)));
+            std::printf("  seeded patch    : tokens=%zu latent_rms=%.6f\n", embeds.size() / 1536,
+                std::sqrt(std::inner_product(latent.begin(), latent.end(), latent.begin(), 0.0) / 64.0));
         }
     } catch (const std::exception & error) {
         std::printf("  prompt stage A  : FAILED: %s\n", error.what());
