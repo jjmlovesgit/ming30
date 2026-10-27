@@ -11,6 +11,9 @@ namespace engine::models::ming3_tts_tiny {
 // Stage B probe: runs as much of the thinker as is implemented and writes capture
 // points (raw little-endian float32 + a manifest) for comparison against the
 // plain-torch reference. Layer 0 only for now: KDA attention, dense MLP, residuals.
+// cuBLAS microbenchmark of one KDA layer's projections at the one-token decode shape.
+void run_gpu_layer_benchmark(const MingTinyAssets & assets, int iterations);
+
 // Per-layer decode state.
 //   KDA keeps the recurrent matrix S plus the last three pre-convolution rows for
 //   q/k/v; MLA keeps the keys and values of every position seen so far.

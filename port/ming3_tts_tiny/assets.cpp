@@ -229,6 +229,10 @@ std::shared_ptr<const MingTinyAssets> load_ming3_tts_tiny_assets(const std::file
             if (const char * p = std::getenv("MING3_TINY_CACHE_PREFILL"); p != nullptr) prefill = static_cast<size_t>(std::atoi(p));
             run_cache_check(*assets, embeds, embeds.size() / 1536, prefill);
         }
+
+        if (const char * gpu_env = std::getenv("MING3_TINY_GPU_BENCH"); gpu_env != nullptr && *gpu_env != '\0') {
+            run_gpu_layer_benchmark(*assets, std::atoi(gpu_env));
+        }
     } catch (const std::exception & error) {
         std::printf("  prompt stage A  : FAILED: %s\n", error.what());
     }
