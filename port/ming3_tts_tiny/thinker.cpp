@@ -1,8 +1,10 @@
 #include "engine/models/ming3_tts_tiny/thinker.h"
 #include "engine/models/ming3_tts_tiny/gpu_bench.h"
 #include "engine/models/ming3_tts_tiny/gpu_moe.h"
+#include "engine/models/ming3_tts_tiny/gpu_residency.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -979,6 +981,43 @@ void run_gpu_moe_benchmark(const MingTinyAssets & assets, int iterations) {
     std::printf("    8 experts     : compute %.3f ms  transfer %.3f ms  sum %.3f ms\n", total_gemm,
         total_xfer, total_gemm + total_xfer);
     std::printf("    verdict       : %s\n", all_pass ? "all selected experts PASS" : "FAILURES present");
+#endif
+}
+
+void run_gpu_residency_probe(const MingTinyAssets & assets) {
+#if !defined(ENGINE_HAS_MING_GPU_BENCH)
+    std::printf("  gpu residency   : not built with CUDA\n");
+    (void) assets;
+#else
+    const auto & source = *assets.weights;
+    constexpr size_t kHiddenLlm = 1536;
+    constexpr size_t kInter = 512;
+    ming_gpu_residency_begin();
+    size_t banks = 0;
+    for (size_t layer = 1; layer < static_cast<size_t>(assets.config.layers); ++layer) {
+        const std::string prefix = "model.layers." + std::to_string(layer) + ".mlp.";
+        const std::vector<std::pair<std::string, std::array<int64_t, 3>>> tensors{
+            {prefix + "experts.gate_proj.weight", {128, static_cast<int64_t>(kInter), static_cast<int64_t>(kHiddenLlm)}},
+            {prefix + "experts.up_proj.weight", {128, static_cast<int64_t>(kInter), static_cast<int64_t>(kHiddenLlm)}},
+            {prefix + "experts.down_proj.weight", {128, static_cast<int64_t>(kHiddenLlm), static_cast<int64_t>(kInter)}},
+        };
+        for (const auto & [name, shape] : tensors) {
+            const auto bank = load_raw(source, name, Shape{shape[0], shape[1], shape[2]});
+            if (ming_gpu_residency_add(bank.bytes.data(), bank.bytes.size()) != 0) {
+                std::printf("  gpu residency   : allocation failed at layer %zu\n", layer);
+                ming_gpu_residency_release();
+                return;
+            }
+            ++banks;
+        }
+    }
+    double out[3] = {0, 0, 0};
+    ming_gpu_residency_end(out);
+    std::printf("  gpu residency   : %zu BF16 bank tensors streamed, total %.0f MiB (%.2f GiB)\n", banks,
+        out[0], out[0] / 1024.0);
+    std::printf("    peak VRAM used: %.0f MiB (%.2f GiB)  free after: %.0f MiB\n", out[1], out[1] / 1024.0,
+        out[2]);
+    ming_gpu_residency_release();
 #endif
 }
 

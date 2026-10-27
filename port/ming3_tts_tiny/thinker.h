@@ -16,6 +16,8 @@ void run_gpu_layer_benchmark(const MingTinyAssets & assets, int iterations);
 // GPU test of routed experts for one MoE layer, with fixed expert ids from the
 // reference run: per-expert outputs and the combined layer output.
 void run_gpu_moe_benchmark(const MingTinyAssets & assets, int iterations);
+// Stream every MoE layer's BF16 expert banks onto the device and report residency.
+void run_gpu_residency_probe(const MingTinyAssets & assets);
 
 // Per-layer decode state.
 //   KDA keeps the recurrent matrix S plus the last three pre-convolution rows for
