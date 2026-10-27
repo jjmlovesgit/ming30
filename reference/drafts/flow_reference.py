@@ -62,21 +62,25 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 def rotary_tables(tokens: int, inv_freq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """cos/sin [T, head_dim] for the rotate-half convention (x_transformers default)."""
+    """cos/sin [T, head_dim], interleaved, exactly as x_transformers builds them.
+
+    x_transformers.RotaryEmbedding.forward stacks (freqs, freqs) on the last axis and
+    flattens, so each frequency appears twice consecutively: [f0,f0,f1,f1,...].
+    """
 
     positions = torch.arange(tokens, dtype=torch.float32)
-    freqs = torch.outer(positions, inv_freq.float())          # [T, head_dim/2]
-    cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1)       # [T, head_dim]
-    sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1)
+    freqs = torch.outer(positions, inv_freq.float())                       # [T, Dh/2]
+    cos = freqs.cos().repeat_interleave(2, dim=-1)                         # [T, Dh]
+    sin = freqs.sin().repeat_interleave(2, dim=-1)
     return cos, sin
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """x: [B, H, T, Dh]; rotate_half pairs (dim, dim + Dh/2)."""
+    """x: [B,H,T,Dh]; x_transformers.rotate_half pairs adjacent (2j, 2j+1) elements."""
 
-    half = x.shape[-1] // 2
-    first, second = x[..., :half], x[..., half:]
-    rotated = torch.cat([-second, first], dim=-1)
+    pairs = x.view(*x.shape[:-1], x.shape[-1] // 2, 2)
+    x1, x2 = pairs[..., 0], pairs[..., 1]
+    rotated = torch.stack([-x2, x1], dim=-1).reshape(x.shape)
     return x * cos + rotated * sin
 
 
@@ -98,6 +102,8 @@ def dit_forward(x: torch.Tensor, timestep: torch.Tensor, cond: torch.Tensor, his
     x_now = weights.linear(x, "x_embedder")                     # [B,1,1024]
     x_hist = weights.linear(history, "x_embedder")
     c = weights.linear(cond, "c_embedder.cond_embedder")        # [B,1,1024]
+    if capture is not None:
+        capture["cond_post_c_embedder"] = c.detach().numpy()
     tokens = torch.cat([t_emb + c, x_hist, x_now], dim=1)       # [B,3,1024]
 
     cos, sin = rotary_tables(tokens.shape[1], weights.get("rotary_embed.inv_freq"))
@@ -139,20 +145,25 @@ def epss_timesteps(steps: int) -> torch.Tensor:
 def flow_sample(cond: torch.Tensor, noise: torch.Tensor, history: torch.Tensor, weights: FlowWeights,
                 steps: int = 10, cfg: float = 1.0, sigma: float = 0.25, temperature: float = 0.0,
                 sway: float = -1.0) -> dict:
+    # condition after c_embedder is step-independent: compute it once
+    cond_post = weights.linear(cond, "c_embedder.cond_embedder").detach().numpy()
+
     y = noise.transpose(1, 2)                                   # [B,1,64]
     t = epss_timesteps(steps)
     t = t + sway * (torch.cos(torch.pi / 2 * t) - 1 + t)
 
-    trajectory, velocities, times = [y.clone()], [], []
+    trajectory, velocities, velocities_pre, times = [y.clone()], [], [], []
+    capture_before = {}
     for t0, t1 in zip(t[:-1], t[1:]):
         if cfg == 1.0:
-            pred = dit_forward(y, t0.expand(1), cond, history, weights)[:, -1:, :]
+            pred = dit_forward(y, t0.expand(1), cond, history, weights, capture_before)[:, -1:, :]
         else:
             both = torch.cat([cond, torch.zeros_like(cond)], dim=0)
             y2 = torch.cat([y, y], dim=0)
             h2 = torch.cat([history, history], dim=0)
-            out = dit_forward(y2, t0.expand(2), both, h2, weights)[:, -1:, :]
+            out = dit_forward(y2, t0.expand(2), both, h2, weights, capture_before)[:, -1:, :]
             pred, null_pred = torch.chunk(out, 2, dim=0)
+            velocities_pre.append(pred.detach().numpy())
             pred = pred + (pred - null_pred) * cfg
         dt = t1 - t0
         y = y + dt * pred
@@ -162,8 +173,9 @@ def flow_sample(cond: torch.Tensor, noise: torch.Tensor, history: torch.Tensor, 
         times.append(float(t0))
         velocities.append(pred.detach().numpy())
         trajectory.append(y.clone())
-    return {"times": times, "velocities": velocities, "trajectory": trajectory,
-            "latents": trajectory[-1].detach().numpy()}
+    return {"times": times, "velocities": velocities, "velocities_pre_cfg": velocities_pre,
+            "trajectory": trajectory, "latents": trajectory[-1].detach().numpy(),
+            "cond_post": cond_post}
 
 
 def main() -> int:
@@ -187,12 +199,18 @@ def main() -> int:
     result = flow_sample(cond, noise, condition, weights, steps=args.steps, cfg=args.cfg)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(args.out / "flow-step.npz",
-                        cond=cond.numpy(), noise=noise.numpy(),
-                        times=np.array(result["times"], dtype=np.float32),
-                        latents=result["latents"],
-                        trajectory=np.concatenate([x.numpy() for x in result["trajectory"]], axis=0),
-                        velocities=np.concatenate(result["velocities"], axis=0))
+    arrays = {
+        "cond": cond.numpy(), "noise": noise.numpy(),
+        "times": np.array(result["times"], dtype=np.float32),
+        "latents": result["latents"],
+        "trajectory": np.concatenate([x.numpy() for x in result["trajectory"]], axis=0),
+        "velocities": np.concatenate(result["velocities"], axis=0),
+    }
+    if result["cond_post"] is not None:
+        arrays["cond_post_c_embedder"] = result["cond_post"]
+    if result["velocities_pre_cfg"]:
+        arrays["velocities_pre_cfg"] = np.concatenate(result["velocities_pre_cfg"], axis=0)
+    np.savez_compressed(args.out / "flow-step.npz", **arrays)
     print(f"cond            : {tuple(cond.shape)} (last thinker position)")
     print(f"noise           : {tuple(noise.shape)} seed={args.seed}")
     print(f"timesteps       : {len(result['times'])} -> {[round(t, 4) for t in result['times'][:4]]}...")

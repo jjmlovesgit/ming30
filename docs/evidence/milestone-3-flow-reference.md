@@ -34,23 +34,56 @@ Saved to `out/reference/flow/flow-step.npz`: cond, noise, timesteps, per-step ve
 trajectory, final latents. That is the exact target the C++ flow must reproduce from the
 same cond and the same noise.
 
-## Status and caveats
+## Conventions pinned to source (not assumed)
 
-This is a **candidate** reference, in the same sense the thinker was before its staged
-comparison: transcribed from `CFM.py`, `dit.py` and `modules.py`, running on real
-weights, but not yet validated against released audio. Two conventions are implemented
-from reading the code and will be mirrored exactly in C++ so that the comparison is
-meaningful:
+Two behaviours decide whether agreement between C++ and Python means anything, so both
+are pinned to the checkpoint's own dependencies rather than to my reading of them.
 
-1. RoPE uses the rotate-half convention (freqs duplicated across halves), applied to all
-   heads since `pe_attn_head` is null.
-2. `sway_sampling_coef = -1` is applied to the timestep grid before integration.
+**RoPE — interleaved, from `x_transformers`:**
 
-If C++ and Python agree per step and the resulting audio is wrong, these two are the first
-places to look — but they are cheap to flip and retest once the comparison harness exists.
+| reference | what it says |
+|---|---|
+| `x_transformers/x_transformers.py` L835 `RotaryEmbedding.__init__` | `inv_freq = 1/(base ** (arange(0, dim, 2)/dim))`, `base = 10000` |
+| same, `forward()` | `freqs = einsum(t, inv_freq)`; `freqs = stack((freqs, freqs), -1)` then flattened — each frequency appears **twice consecutively**, i.e. interleaved |
+| same, L893 `rotate_half` | `rearrange('... (d r) -> ... d r', r=2)` then `stack((-x2, x1))` — rotate **adjacent pairs** `(2j, 2j+1)` |
+| same, L900 `apply_rotary_pos_emb` | `t*cos(freqs) + rotate_half(t)*sin(freqs)` |
+| `modules.py` L~100 | `RotaryEmbedding(hidden_size // num_heads)` with defaults; `pe_attn_head` is null so RoPE applies to **all** heads |
+| `dit.py` L114 | same construction, `dim = 1024 // 16 = 64` |
+| checkpoint tensor | `flowloss.cfm.model.rotary_embed.inv_freq`, shape `[32]` — matches `arange(0,64,2)` |
+| `use_xpos = False` (default) | `forward` returns `(freqs, 1.)`, so `apply_rotary_pos_emb` runs with `scale = 1` |
+
+**Correction:** my first implementation used the rotate-half (halves) convention. That was
+wrong against this source. Switching to interleaved changed the result — latents rms
+`0.81920 → 0.81314` — which is exactly the kind of silent convention error the pinning was
+meant to catch.
+
+**Sway and epss schedule — defaults, not configured:**
+
+| reference | what it says |
+|---|---|
+| `CFM.py` L~133 `CFM.sample` signature | `sway_sampling_coef=-1.0`, `use_epss=True`, `t_start=0` |
+| `CFM.py` `get_epss_timesteps` | `10 -> [0,2,4,6,8,12,16,20,24,28,32] / 32` |
+| `CFM.py` sway application | `t = t + coef*(cos(pi/2*t) - 1 + t)`, applied before integration |
+| `flowloss.py` `FlowLoss.sample` | forwards `cfg_scale, patch_size, sigma, temperature, steps, generator` only — **no sway or epss override** |
+| `modeling_lingv3_tts.py` L601 | calls `flowloss.sample(...)` with no sway argument, so the CFM defaults apply |
+
+## Captures for the C++ comparison
+
+`out/reference/flow/flow-step.npz` (cfg = 1) and `flow-cfg2/flow-step.npz` (cfg = 2):
+
+| capture | shape | note |
+|---|---|---|
+| `cond` | (1,1,1536) | thinker hidden, last position |
+| `cond_post_c_embedder` | (1,1,1024) | step-independent; rms 1.1447; **identical across cfg runs** |
+| `noise` | (1,64,1) | seed 1234, the literal tensor both sides must use |
+| `times` | (10,) | swayed grid |
+| `velocities` | (10,1,64) | post-guidance velocity per step |
+| `velocities_pre_cfg` | (10,1,64) | **only at cfg > 1**; max abs pre-vs-post at step 0 = 2.514 |
+| `trajectory` | (11,1,64) | `x` after each Euler step, including the initial `y0` |
+| `latents` | (1,1,64) | final latent; rms 0.81314 (cfg 1) / 0.82075 (cfg 2) |
 
 ## Next
 
-1. Port the DiT forward and Euler solver to C++, mirroring these conventions.
-2. Compare per step: velocity, `x`, and the final latents, given the same cond and noise.
-3. Then the VAE: feed both sides identical latents and compare the waveform.
+Port the DiT and Euler solver to C++ using the interleaved RoPE and the CFM default
+sway/epss schedule above, then compare `cond_post_c_embedder`, every step's velocity,
+the trajectory and the final latents — then the VAE with identical latents.
